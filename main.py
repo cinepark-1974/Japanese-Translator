@@ -1,5 +1,5 @@
 """
-BLUE JEANS PICTURES — Japanese-Translator v1.0
+BLUE JEANS PICTURES — Japanese-Translator
 한국어 시나리오 → 일본어 번역 (5-Stage Market Adaptation Pipeline)
 Powered by Anthropic Claude API
 
@@ -9,6 +9,26 @@ Pipeline:
   Stage 3: Voice Rewrite (Opus) — 번역체 제거, 일본 시나리오 문체
   Stage 4: Dialogue Polish (Opus) — 경어 설계, 대사 현지화
   Stage 5: QA Check (Sonnet) — 포맷/경어/문화코드/스토리 검증 리포트
+
+─────────────────────────────────────────────
+CHANGELOG (최신이 위)
+─────────────────────────────────────────────
+v1.1 (2026-09-17)
+  - 로컬라이징 대조표(XLSX) 업로드 지원
+    · 다중 시트 자동 인식 (주요 인물 / 조·단역 / 지명·기관 / 법조문)
+    · 일본어 열 자동 매칭 (일본명·일본판·요미가나·대사 헤드(일))
+    · 일본어 열이 없는 시트(영문 전용)는 자동으로 건너뜀
+    · 다른 시트의 '약칭'을 교차 참조해 극중 축약 호칭도 매핑
+  - loc_map(extras/places/legal/corrections)을 Stage 1·3·4 프롬프트에 강제 주입
+  - Stage 5 QA에 매핑 원본 동봉 → 미적용 항목 지적
+  - 신설: apply_korean_residue_fix() — 남은 한글 고유명사 강제 치환
+  - 신설: apply_glossary_enforcement() — 구판 오표기 일본어 강제 치환
+  - 신설: check_glossary_residue() — 한국 고유 요소 잔존 검수 리포트
+  - 신설 UI: 🔎 LOCALIZATION AUDIT 섹션
+  - VERSION 표기를 prompt.ENGINE_VERSION 단일 출처로 통일
+
+v1.0
+  - 5-Stage Market Adaptation Pipeline 최초 구성
 """
 
 import streamlit as st
@@ -20,6 +40,8 @@ import json
 import time
 
 from prompt import (
+    ENGINE_VERSION,
+    ENGINE_BUILD_DATE,
     STYLE_PRESETS,
     KEIGO_TONE_TAGS,
     MODEL_POLICY,
@@ -36,7 +58,7 @@ from prompt import (
 # PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Japanese-Translator v1.0 | BLUE JEANS PICTURES",
+    page_title=f"Japanese-Translator v{ENGINE_VERSION} | BLUE JEANS PICTURES",
     page_icon="🎌",
     layout="wide",
 )
@@ -152,12 +174,453 @@ div[data-testid="stFileUploader"] { background-color: #fff !important; border-ra
 # CONSTANTS
 # ─────────────────────────────────────────────
 MAX_CHARS_PER_PAGE = 8000
-VERSION = "1.0"
+VERSION = ENGINE_VERSION  # prompt.py 단일 출처 — 버전 표기 일원화
 
 
 # ─────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════
+# ★ v1.1 — LOCALIZATION WORKBOOK (XLSX 대조표)
+# 한·영·일 대조표에서 '일본어 열'만 골라 매핑을 만든다.
+# ═══════════════════════════════════════════════════
+
+# ── 시트 분류 키워드 (시트명에 포함되면 해당 분류) ──
+_SHEET_EXTRAS_KEYS = ["단역", "조역", "조연", "端役", "extra", "minor", "bit"]
+_SHEET_LEGAL_KEYS = ["법조문", "법령", "법률", "조문", "직급", "법전", "legal"]
+_SHEET_PLACES_KEYS = ["지명", "기관", "장소", "용어", "명칭", "고유명사",
+                      "place", "location", "term"]
+
+# ── 헤더 컬럼 인식 키워드 ──
+_COL_KO_KEYS = ["한국명", "한국이름", "한국판", "한국어", "원문", "국문", "korean"]
+_COL_JP_KEYS = ["일본명", "일본판", "일본어", "일문", "japanese", "日本"]
+# 일본어 열로 오인하면 안 되는 헤더 (역할·비고·요미가나 등)
+_COL_JP_EXCLUDE = ["영문", "english", "요미가나", "로마자", "비고", "대응", "정확도",
+                   "역할", "role", "맥락", "의도", "성별", "출처", "헤드", "연령"]
+_COL_YOMI_KEYS = ["요미가나", "よみ", "読み", "yomi", "가나"]
+_COL_CUE_KEYS = ["대사 헤드", "대사헤드", "cue"]      # 대사 헤드(일) — 극중 호칭 표기
+_COL_SHORT_KEYS = ["약칭", "short"]                   # 극중 축약 호칭 (석훈, 도현 …)
+_COL_TONE_KEYS = ["경어", "톤", "tone", "keigo"]
+_COL_WRONG_KEYS = ["v1", "수정 전", "수정전", "오표기", "before", "직역 상태"]
+
+
+def _norm_header(v) -> str:
+    return str(v or "").strip().lower().replace(" ", "")
+
+
+def _pick_column(headers: list, keys: list, exclude_keys: list = None) -> int:
+    """헤더 리스트에서 키워드에 맞는 컬럼 인덱스를 찾는다. 없으면 -1."""
+    exclude_keys = exclude_keys or []
+    best = -1
+    best_score = -1
+    for idx, h in enumerate(headers):
+        hn = _norm_header(h)
+        if not hn:
+            continue
+        if any(_norm_header(x) in hn for x in exclude_keys):
+            continue
+        for k in keys:
+            if _norm_header(k) in hn:
+                # '확정' / 'v3' 가 붙은 열을 우선한다
+                score = 1
+                if "확정" in hn:
+                    score += 2
+                if "v3" in hn:
+                    score += 1
+                if score > best_score:
+                    best_score = score
+                    best = idx
+    return best
+
+
+def _clean_term(v, strip_kr_note: bool = False) -> str:
+    """셀 값을 문자열로 정리한다.
+
+    strip_kr_note=True 이면 일본어 값 뒤에 붙은 '한글만 들어있는 괄호 주석'을 제거한다.
+    예) "国税調査官（국세전문관 채용）" → "国税調査官"
+        "国税調査官（国税専門官採用）" → 그대로 유지 (일본어 주석은 남긴다)
+    """
+    if v is None:
+        return ""
+    t = str(v).strip()
+    if t in {"—", "-", "–", "N/A", "n/a", "없음", "변경 없음", "None"}:
+        return ""
+    if strip_kr_note:
+        # 괄호 안이 한글을 포함하고 일본어(히라가나·가타카나·한자)를 포함하지 않을 때만 제거
+        t = re.sub(
+            r"\s*[（(](?=[^）)]*[가-힣])(?![^）)]*[ぁ-んァ-ヶ一-龥])[^）)]*[）)]",
+            "",
+            t,
+        ).strip()
+        # 설명용 대시 뒤 한글 주석 제거: "相続税法第41条（物納）— 물납재산 순위에 …"
+        t = re.sub(r"\s*[—–]\s*[^—–]*[가-힣][^—–]*$", "", t).strip()
+    return t
+
+
+def _has_hangul(s: str) -> bool:
+    return bool(re.search(r"[가-힣]", str(s or "")))
+
+
+def _split_variants(text: str) -> list:
+    """'A / B' 같은 셀을 개별 표기로 분해한다."""
+    if not text:
+        return []
+    out = []
+    for chunk in re.split(r"\s*[/／]\s*", str(text)):
+        chunk = chunk.strip(" .·\t")
+        if chunk and chunk not in out:
+            out.append(chunk)
+    return out
+
+
+def _flexible_pattern(term: str) -> "re.Pattern":
+    """표기 차이를 흡수하는 검색 패턴을 만든다. (v1.1)
+
+    번역 결과물은 괄호( () vs （） ), 중점( · vs ・ ), 대시, 줄바꿈 공백이
+    대조표와 다르게 나오는 경우가 많다. 그 차이로 치환이 누락되지 않도록
+    해당 문자들을 유연하게 매칭한다.
+    """
+    esc = re.escape(str(term))
+    esc = re.sub(r"\\?[（(]", "[（(]", esc)
+    esc = re.sub(r"\\?[）)]", "[）)]", esc)
+    esc = re.sub(r"\\?[・·]", "[・·]", esc)
+    esc = re.sub(r"\\?[-–—−]", "[-–—−]", esc)
+    esc = re.sub(r"(?:\\\s|\s)+", r"\\s*", esc)
+    return re.compile(esc)
+
+
+def _is_safe_correction(bad: str, good: str) -> bool:
+    """기계 치환해도 안전한 교정쌍인지 판정한다."""
+    if not bad or not good:
+        return False
+    b, g = str(bad).strip(), str(good).strip()
+    if b == g:
+        return False
+    if b in g:            # 재귀 치환 방지
+        return False
+    if len(b) < 2:
+        return False
+    return True
+
+
+def parse_translation_workbook(uploaded_file):
+    """XLSX 로컬라이징 대조표를 파싱한다. (v1.1)
+
+    반환: (char_map, char_tones, loc_map, char_yomi)
+      char_map  : {한국명: 일본명}            — 주요 등장인물 (+약칭 → 대사 헤드)
+      char_tones: {일본명: keigo tag}          — 경어 태그 열이 있을 때
+      loc_map   : {
+            "extras":      {한국명: 일본명},
+            "places":      {한국어 원문: 확정 일본어},
+            "legal":       {한국 법조문: 일본 법조문},
+            "corrections": {구판 오표기 일본어: 확정 일본어},
+        }
+      char_yomi : {일본명: 요미가나}           — UI 표시용
+
+    시트명·헤더명을 키워드로 자동 인식한다.
+    일본어 열이 없는 시트(영문 전용)는 건너뛴다.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        raise RuntimeError("openpyxl이 설치되어 있지 않습니다. requirements.txt를 확인하세요.")
+
+    data = uploaded_file.read()
+    uploaded_file.seek(0)
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+
+    char_map, char_tones, char_yomi = {}, {}, {}
+    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
+
+    # ── 사전 스캔: 어느 시트에 있든 '한국명 → 약칭'을 모아둔다 ──
+    # (한·영·일 시트에는 약칭 열이 없고, 영문 시트에만 있는 경우가 많다)
+    short_index = {}
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
+        for row in rows[:6]:
+            cand = list(row)
+            ko_i = _pick_column(cand, _COL_KO_KEYS)
+            sh_i = _pick_column(cand, _COL_SHORT_KEYS)
+            if ko_i >= 0 and sh_i >= 0:
+                start = rows.index(row) + 1
+                for r in rows[start:]:
+                    if not r or len(r) <= max(ko_i, sh_i):
+                        continue
+                    ko = _clean_term(r[ko_i])
+                    sh = _clean_term(r[sh_i])
+                    if ko and sh and ko != sh:
+                        short_index.setdefault(ko, sh)
+                break
+
+    # ── 본 스캔 ──
+    for ws in wb.worksheets:
+        sheet_name = str(ws.title).lower()
+
+        if any(k in sheet_name for k in _SHEET_EXTRAS_KEYS):
+            bucket = "extras"
+        elif any(k in sheet_name for k in _SHEET_LEGAL_KEYS):
+            bucket = "legal"
+        elif any(k in sheet_name for k in _SHEET_PLACES_KEYS):
+            bucket = "places"
+        else:
+            bucket = "characters"
+
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+
+        # 헤더 행 탐색 (앞 6행 안에서 한국어 열과 일본어 열이 모두 잡히는 행)
+        header_idx, headers = -1, []
+        for i, row in enumerate(rows[:6]):
+            cand = list(row)
+            ko_i = _pick_column(cand, _COL_KO_KEYS)
+            jp_i = _pick_column(cand, _COL_JP_KEYS, exclude_keys=_COL_JP_EXCLUDE)
+            if ko_i >= 0 and jp_i >= 0:
+                header_idx, headers = i, cand
+                break
+        if header_idx < 0:
+            # 일본어 열이 없는 시트(영문 전용 등)는 건너뛴다
+            continue
+
+        ko_i = _pick_column(headers, _COL_KO_KEYS)
+        jp_i = _pick_column(headers, _COL_JP_KEYS, exclude_keys=_COL_JP_EXCLUDE)
+        tone_i = _pick_column(headers, _COL_TONE_KEYS)
+        yomi_i = _pick_column(headers, _COL_YOMI_KEYS)
+        cue_i = _pick_column(headers, _COL_CUE_KEYS)
+        short_i = _pick_column(headers, _COL_SHORT_KEYS)
+
+        # 구판 오표기 열: '일본판 (수정 전)' 처럼 '일본'과 함께 있을 때만 인정
+        wrong_i = -1
+        for idx, h in enumerate(headers):
+            hn = _norm_header(h)
+            if not hn or idx == jp_i:
+                continue
+            if any(_norm_header(k) in hn for k in _COL_WRONG_KEYS) and \
+               ("일본" in hn or "japanese" in hn):
+                wrong_i = idx
+                break
+
+        for row in rows[header_idx + 1:]:
+            if not row or len(row) <= max(ko_i, jp_i):
+                continue
+            ko = _clean_term(row[ko_i])
+            jp = _clean_term(row[jp_i], strip_kr_note=True)
+            if not ko or not jp:
+                continue
+
+            if bucket == "characters":
+                char_map[ko] = jp
+
+                if yomi_i >= 0 and len(row) > yomi_i:
+                    yomi = _clean_term(row[yomi_i])
+                    if yomi:
+                        char_yomi[jp] = yomi
+
+                # 약칭(석훈) → 대사 헤드(神崎) 도 매핑에 포함한다.
+                # 원고 본문·대사 헤드에는 약칭이 훨씬 자주 등장한다.
+                cue = _clean_term(row[cue_i], strip_kr_note=True) if (cue_i >= 0 and len(row) > cue_i) else ""
+                short = _clean_term(row[short_i]) if (short_i >= 0 and len(row) > short_i) else ""
+                if not short:
+                    short = short_index.get(ko, "")
+                if short and short not in char_map:
+                    char_map[short] = cue or jp
+
+                if tone_i >= 0 and len(row) > tone_i:
+                    tone = _clean_term(row[tone_i]).lower()
+                    if tone in KEIGO_TONE_TAGS:
+                        char_tones[jp] = tone
+            else:
+                loc_map[bucket][ko] = jp
+
+            # 구판 오표기 → 확정 일본어 (교정 매핑)
+            if wrong_i >= 0 and len(row) > wrong_i:
+                wrong_raw = _clean_term(row[wrong_i])
+                for variant in _split_variants(wrong_raw):
+                    if _is_safe_correction(variant, jp):
+                        loc_map["corrections"][variant] = jp
+
+    return char_map, char_tones, loc_map, char_yomi
+
+
+def count_loc_entries(loc_map: dict) -> int:
+    """loc_map 총 항목 수."""
+    if not loc_map:
+        return 0
+    return sum(len(v or {}) for v in loc_map.values())
+
+
+def _build_ko_jp_pairs(char_map: dict, loc_map: dict) -> list:
+    """한글 → 일본어 기계 치환에 쓸 안전한 쌍 목록을 만든다. (v1.1)
+
+    - 키에 한글이 있어야 한다 (일본어 원고에 한글은 남으면 안 되므로 안전)
+    - 값에 한글이 있으면 제외 (한글을 새로 심는 사고 방지)
+    - 법조문(legal)은 값이 설명형 장문이라 기계 치환에서 제외한다
+    - 'A / B' 형태는 좌우 개수가 맞을 때만 1:1로 분해한다
+    """
+    pairs = []
+    seen = set()
+
+    def add(ko, jp):
+        ko, jp = str(ko).strip(), str(jp).strip()
+        if len(ko) < 2 or not _has_hangul(ko) or _has_hangul(jp) or not jp:
+            return
+        if ko in seen:
+            return
+        seen.add(ko)
+        pairs.append((ko, jp))
+
+    sources = [char_map or {}]
+    if loc_map:
+        sources.append(loc_map.get("extras") or {})
+        sources.append(loc_map.get("places") or {})
+
+    for mapping in sources:
+        for ko, jp in mapping.items():
+            add(ko, jp)
+            ko_parts = _split_variants(ko)
+            jp_parts = _split_variants(jp)
+            if len(ko_parts) > 1 and len(ko_parts) == len(jp_parts):
+                for k, j in zip(ko_parts, jp_parts):
+                    add(k, j)
+
+    # 긴 표기부터 치환해야 부분 일치 사고가 없다 (서울지방국세청 > 서울)
+    pairs.sort(key=lambda x: len(x[0]), reverse=True)
+    return pairs
+
+
+def apply_korean_residue_fix(text: str, char_map: dict, loc_map: dict) -> tuple:
+    """번역 결과에 남은 한글 고유명사를 확정 일본어 표기로 강제 치환한다. (v1.1)
+
+    일본어 원고에 한글이 남아 있으면 그 자체가 결함이므로,
+    대조표에 있는 항목에 한해 기계적으로 치환해도 안전하다.
+
+    반환: (치환된 텍스트, [(한국어, 일본어, 횟수), ...])
+    """
+    if not text:
+        return text, []
+
+    pairs = _build_ko_jp_pairs(char_map, loc_map)
+    if not pairs:
+        return text, []
+
+    log = []
+    placeholders = {}
+
+    for i, (ko, jp) in enumerate(pairs):
+        pattern = _flexible_pattern(ko)
+        found = len(pattern.findall(text))
+        if found:
+            token = f"\x00BJP{i}\x00"
+            text = pattern.sub(token, text)
+            placeholders[token] = jp
+            log.append((ko, jp, found))
+
+    for token, jp in placeholders.items():
+        text = text.replace(token, jp)
+
+    return text, log
+
+
+def apply_glossary_enforcement(text: str, loc_map: dict) -> tuple:
+    """구판 오표기 일본어를 확정 표기로 강제 치환한다. (v1.1)
+
+    반환: (치환된 텍스트, [(오표기, 확정, 횟수), ...])
+    """
+    if not text or not loc_map:
+        return text, []
+
+    corrections = loc_map.get("corrections") or {}
+    if not corrections:
+        return text, []
+
+    log = []
+    placeholders = {}
+
+    for i, bad in enumerate(sorted(corrections.keys(), key=len, reverse=True)):
+        good = corrections[bad]
+        pattern = _flexible_pattern(bad)
+        found = len(pattern.findall(text))
+        if found:
+            token = f"\x00BJC{i}\x00"
+            text = pattern.sub(token, text)
+            placeholders[token] = good
+            log.append((bad, good, found))
+
+    for token, good in placeholders.items():
+        text = text.replace(token, good)
+
+    return text, log
+
+
+# 한국 고유 요소 잔존 탐지 패턴 (일본어 원고 기준)
+_RESIDUE_PATTERNS = [
+    (r"[가-힣]{2,}", "한글 원문 잔존"),
+    (r"(?:ソウル|セジョン|ノウォン|カンナム|チョンノ|イテウォン|ハンガン|"
+     r"コエックス|プサン|インチョン|テグ|クァンジュ)", "카타카나 한국 지명"),
+    (r"(?:キム|パク|チョン|チェ|カン|ハン|ユン|シン|クォン|ミョン|ソン|ペ)"
+     r"[・･\s]?[ァ-ヶー]{2,}", "카타카나 한국식 인명 의심"),
+    (r"(?:オッパ|ヒョン|ヌナ|オンニ|アジョシ|アジュンマ|ソンベ)", "한국식 호칭 미변환"),
+    (r"(?:ウォン|₩)", "원화 표기"),
+    (r"\b(?:Seoul|Sejong|Nowon|Gangnam|Jongno|Itaewon|Hangang)\b", "로마자 한국 지명"),
+    (r"(?:相続税及び贈与税法|国税基本法|租税犯処罰法|特定経済犯罪加重処罰法|"
+     r"公務員行動綱領)", "한국 법령명 직역"),
+    (r"(?:고합|コハプ|コ・ハプ)", "한국식 사건번호"),
+    (r"[89]\s*級(?!数)", "한국식 공무원 급수"),
+    (r"(?:キムチ|ソジュ|マッコリ|サムギョプサル|チゲ|ラミョン)", "미현지화 문화어"),
+]
+
+
+def check_glossary_residue(text: str, char_map: dict, loc_map: dict) -> dict:
+    """번역 결과에 한국 고유 요소·미적용 매핑이 남아있는지 검수한다. (v1.1)
+
+    반환: {
+        "unapplied": [(한국어, 목표 일본어, 분류)],   # 한국어 원문이 그대로 남은 항목
+        "missing":   [(한국어, 목표 일본어, 분류)],   # 목표 일본어가 한 번도 안 나온 항목
+        "residue":   [(라벨, 샘플[:8], 총 건수)],     # 패턴 기반 잔존
+        "corrections_left": [(오표기, 확정, 건수)],
+    }
+    """
+    result = {"unapplied": [], "missing": [], "residue": [], "corrections_left": []}
+    if not text:
+        return result
+
+    buckets = [("주요 인물", char_map or {})]
+    if loc_map:
+        buckets.append(("조·단역", loc_map.get("extras") or {}))
+        buckets.append(("지명·기관·용어", loc_map.get("places") or {}))
+        buckets.append(("법조문·직급", loc_map.get("legal") or {}))
+
+    for label, mapping in buckets:
+        for ko, jp in mapping.items():
+            if ko and ko in text:
+                result["unapplied"].append((ko, jp, label))
+            # 목표 일본어가 전혀 등장하지 않으면 미반영 의심
+            head = re.split(r"\s*[/／]\s*", str(jp))[0].strip()
+            head = re.split(r"[（(]", head)[0].strip()
+            if label != "법조문·직급" and head and len(head) >= 2 and head not in text:
+                result["missing"].append((ko, jp, label))
+
+    for pattern, label in _RESIDUE_PATTERNS:
+        hits = re.findall(pattern, text)
+        if hits:
+            uniq = []
+            for h in hits:
+                h = str(h).strip()
+                if h and h not in uniq:
+                    uniq.append(h)
+            result["residue"].append((label, uniq[:8], len(hits)))
+
+    corrections = (loc_map or {}).get("corrections") or {}
+    for bad, good in corrections.items():
+        n = len(_flexible_pattern(bad).findall(text))
+        if n:
+            result["corrections_left"].append((bad, good, n))
+
+    return result
+
+# ── END LOCALIZATION HELPERS ──
+
 
 def parse_character_map(uploaded_file) -> tuple:
     """Parse character name mapping from CSV or TXT file.
@@ -165,6 +628,12 @@ def parse_character_map(uploaded_file) -> tuple:
     한국이름,일본이름,경어태그,호칭메모
     """
     name = uploaded_file.name.lower()
+
+    # ★ v1.1 — XLSX 로컬라이징 대조표는 전용 파서로 넘긴다
+    if name.endswith((".xlsx", ".xlsm")):
+        cm, ct, _lm, _yomi = parse_translation_workbook(uploaded_file)
+        return cm, ct
+
     content = uploaded_file.read().decode("utf-8", errors="replace")
     uploaded_file.seek(0)
 
@@ -585,7 +1054,8 @@ st.markdown(
     'Stage 3: Voice Rewrite → Opus (번역체 제거, 일본 시나리오 문체)<br>'
     'Stage 4: Dialogue Polish → Opus (경어 설계, 대사 현지화)<br>'
     'Stage 5: QA Check → Sonnet (포맷/경어/문화코드/스토리 검증)<br>'
-    '<br>💡 각 단계별로 독립 실행 · 결과 저장 · 이어서 진행 가능</div>',
+    '<br>💡 각 단계별로 독립 실행 · 결과 저장 · 이어서 진행 가능<br>'
+    '🔎 대조표를 올리면 Stage 1·3·4에 매핑이 강제 주입되고, 하단 LOCALIZATION AUDIT에서 잔존 검수가 가능합니다.</div>',
     unsafe_allow_html=True
 )
 
@@ -594,37 +1064,116 @@ st.markdown(
 # CHARACTER MAP
 # ═══════════════════════════════════════════════════
 
-st.markdown('<div class="section-header">👤 CHARACTER MAP — 인물표</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">👤 LOCALIZATION MAP — 로컬라이징 대조표</div>', unsafe_allow_html=True)
 
-st.info("💡 CSV/TXT 파일을 업로드하세요. 3번째 열에 경어 태그(keigo/teinei/tameguchi/kenson/ibar) 추가 가능!")
+st.info(
+    "💡 **XLSX 대조표**를 올리면 주요 인물 · 조단역 · 지명/기관/고유명사 · 법조문까지 한 번에 반영됩니다. "
+    "한·영·일 대조표를 그대로 올리면 일본어 열만 자동으로 읽습니다. "
+    "기존 CSV/TXT 인물표도 그대로 사용할 수 있습니다."
+)
 
 char_map_file = st.file_uploader(
-    "인물표 파일 업로드",
-    type=["csv", "txt"],
-    help="CSV: 한국이름,일본이름,경어태그 | TXT: 한국이름 → 일본이름 → 경어태그",
+    "대조표 파일 업로드",
+    type=["xlsx", "xlsm", "csv", "txt"],
+    help="XLSX: 다중 시트 대조표 (권장) | CSV: 한국이름,일본이름,경어태그 | TXT: 한국이름 → 일본이름",
     key="char_map_upload"
 )
 
 char_map = {}
 char_tones = {}
+char_yomi = {}
+loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
 
 if char_map_file:
-    char_map, char_tones = parse_character_map(char_map_file)
-    if char_map:
-        st.success(f"✅ {len(char_map)}명 매핑 로드 · {len(char_tones)}명 경어 태그 설정됨")
-        rows = []
-        for ko, jp in char_map.items():
-            tone = char_tones.get(jp, "—")
-            tone_label = KEIGO_TONE_TAGS[tone]["label"] if tone in KEIGO_TONE_TAGS else "—"
-            rows.append(f"<tr><td>{ko}</td><td>→</td><td><strong>{jp}</strong></td><td>{tone_label}</td></tr>")
-        st.markdown(f"""
-        <table class="char-table">
-            <tr><th>한국이름</th><th></th><th>日本語名</th><th>敬語レベル</th></tr>
-            {"".join(rows)}
-        </table>
-        """, unsafe_allow_html=True)
+    fname = char_map_file.name.lower()
+    try:
+        if fname.endswith((".xlsx", ".xlsm")):
+            char_map, char_tones, loc_map, char_yomi = parse_translation_workbook(char_map_file)
+        else:
+            char_map, char_tones = parse_character_map(char_map_file)
+    except Exception as e:
+        st.error(f"❌ 대조표를 읽는 중 오류가 발생했습니다: {e}")
+        char_map, char_tones = {}, {}
+
+    if char_map or count_loc_entries(loc_map):
+        # 세션에 저장 (재업로드 없이 유지)
+        st.session_state["saved_char_map"] = char_map
+        st.session_state["saved_char_tones"] = char_tones
+        st.session_state["saved_loc_map"] = loc_map
+        st.session_state["saved_char_yomi"] = char_yomi
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("주요 인물", f"{len(char_map)}")
+        c2.metric("조·단역", f"{len(loc_map.get('extras') or {})}")
+        c3.metric("지명·기관·용어", f"{len(loc_map.get('places') or {})}")
+        c4.metric("법조문·직급", f"{len(loc_map.get('legal') or {})}")
+
+        st.success(
+            f"✅ 총 {len(char_map) + count_loc_entries(loc_map)}건 로드 "
+            f"· 경어 태그 {len(char_tones)}건"
+        )
+
+        with st.expander("📑 로드된 매핑 확인", expanded=False):
+            tab1, tab2, tab3, tab4 = st.tabs(
+                ["주요 인물", "조·단역", "지명·기관·용어", "법조문·직급"]
+            )
+            with tab1:
+                if char_map:
+                    rows = []
+                    for ko, jp in char_map.items():
+                        tone = char_tones.get(jp, "—")
+                        tone_label = KEIGO_TONE_TAGS[tone]["label"] if tone in KEIGO_TONE_TAGS else "—"
+                        yomi = char_yomi.get(jp, "")
+                        rows.append(
+                            f"<tr><td>{ko}</td><td>→</td><td><strong>{jp}</strong></td>"
+                            f"<td>{yomi}</td><td>{tone_label}</td></tr>"
+                        )
+                    st.markdown(f"""
+                    <table class="char-table">
+                        <tr><th>한국이름</th><th></th><th>日本語名</th><th>よみ</th><th>敬語レベル</th></tr>
+                        {"".join(rows)}
+                    </table>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.caption("없음")
+            with tab2:
+                extras = loc_map.get("extras") or {}
+                if extras:
+                    st.table([{"한국어": k, "日本語": v} for k, v in extras.items()])
+                else:
+                    st.caption("없음")
+            with tab3:
+                places = loc_map.get("places") or {}
+                if places:
+                    st.table([{"한국어 원문": k, "확정 일본어": v} for k, v in places.items()])
+                else:
+                    st.caption("없음")
+            with tab4:
+                legal = loc_map.get("legal") or {}
+                if legal:
+                    st.caption("법조문은 프롬프트 참조용으로만 전달되며, 기계 치환 대상이 아닙니다.")
+                    st.table([{"한국판 근거": k, "일본판 조문": v} for k, v in legal.items()])
+                else:
+                    st.caption("없음")
+
+        if loc_map.get("corrections"):
+            with st.expander(f"🛠 구판 오표기 교정 매핑 ({len(loc_map['corrections'])}건)", expanded=False):
+                st.table([{"오표기": k, "확정 표기": v} for k, v in loc_map["corrections"].items()])
     else:
-        st.warning("⚠️ 인물 매핑을 읽을 수 없습니다.")
+        st.warning(
+            "⚠️ 매핑을 읽을 수 없습니다. 시트 헤더에 '한국명'(또는 '한국판 원문')과 "
+            "'일본명'(또는 '일본판') 열이 있는지 확인해 주세요."
+        )
+
+# 대조표를 다시 올리지 않아도 세션 보관본을 사용한다
+if not char_map and st.session_state.get("saved_char_map"):
+    char_map = st.session_state.get("saved_char_map") or {}
+    char_tones = st.session_state.get("saved_char_tones") or {}
+    loc_map = st.session_state.get("saved_loc_map") or loc_map
+    char_yomi = st.session_state.get("saved_char_yomi") or {}
+    st.caption(
+        f"↩️ 이전 매핑 사용 중 — 인물 {len(char_map)}건 · 기타 {count_loc_entries(loc_map)}건"
+    )
 
 # Manual keigo assignment
 if char_map and not char_tones:
@@ -640,7 +1189,34 @@ if char_map and not char_tones:
             if tone != "—":
                 char_tones[jp] = tone
 
-with st.expander("📋 인물표 파일 예시 보기"):
+with st.expander("📋 XLSX 대조표 양식 안내", expanded=False):
+    st.markdown("""
+**시트 구성** — 시트명에 아래 단어가 들어가면 자동 분류됩니다.
+
+| 시트명 예시 | 분류 | 인식 키워드 |
+|---|---|---|
+| 한·영·일 이름 대조 | 주요 인물 | (그 외 전부) |
+| 조·단역 한영일 | 조·단역 | 단역 · 조역 · 조연 |
+| 일본판 지명·기관·고유명사 | 지명·기관·용어 | 지명 · 기관 · 장소 · 용어 · 명칭 · 고유명사 |
+| 일본판 법조문 | 법조문·직급 | 법조문 · 법령 · 법률 · 조문 · 직급 |
+
+**열 구성** — 헤더 이름으로 자동 인식합니다. 순서는 상관없습니다.
+
+| 열 | 인식 키워드 | 용도 |
+|---|---|---|
+| 한국명 / 한국판 원문 / 한국판 근거 | 한국명 · 한국이름 · 한국판 · 원문 | 치환 대상 |
+| 일본명 (한자) / 일본판 (확정안) | 일본명 · 일본판 · 일본어 | 확정 표기 |
+| 요미가나 | 요미가나 · 読み | 표시용 (프롬프트 미주입) |
+| 대사 헤드(일) | 대사 헤드 · cue | 약칭과 짝지어 극중 호칭으로 매핑 |
+| 약칭 | 약칭 | 다른 시트에 있어도 한국명으로 교차 참조 |
+| 경어태그 | 경어 · 톤 · keigo | keigo / teinei / tameguchi / kenson / ibar |
+
+- **영문 열만 있는 시트는 자동으로 건너뜁니다.** 한·영·일 통합 대조표를 그대로 올리면 됩니다.
+- `역할 (일본판)` `비고` `대응 정확도` 처럼 표기가 아닌 열은 매핑에 쓰이지 않습니다.
+- 일본어 값 뒤의 **한글 전용 괄호 주석**은 자동 제거됩니다. (일본어 괄호 주석은 유지)
+""")
+
+with st.expander("📋 CSV / TXT 인물표 예시 보기"):
     st.code("""# CSV 형식 — 4열: 한국이름, 일본이름, 경어태그, 호칭메모(선택)
 한국이름,일본이름,경어태그,호칭메모
 김지훈,中村智弘,teinei,松田には敬語
@@ -793,6 +1369,7 @@ if can_run:
             char_map=char_map,
             style_prompt=selected_style["prompt"],
             custom_instructions=custom_instructions,
+            loc_map=loc_map,
         )
         model_id = MODEL_POLICY["stage_1"]["model"]
         pages = split_into_pages(source_text)
@@ -848,6 +1425,7 @@ if stage_3_input and api_key:
             char_tones=char_tones,
             style_prompt=selected_style["prompt"],
             custom_instructions=custom_instructions,
+            loc_map=loc_map,
         )
         model_id = MODEL_POLICY["stage_3"]["model"]
         pages = split_into_pages(stage_3_input)
@@ -887,6 +1465,7 @@ if stage_4_input and api_key:
             char_tones=char_tones,
             style_prompt=selected_style["prompt"],
             custom_instructions=custom_instructions,
+            loc_map=loc_map,
         )
         model_id = MODEL_POLICY["stage_4"]["model"]
         pages = split_into_pages(stage_4_input)
@@ -921,7 +1500,10 @@ if stage_5_input and api_key:
     if st.button("▶️ Stage 5 실행", key="btn_stage5", use_container_width=True):
         client = anthropic.Anthropic(api_key=api_key)
 
-        system_prompt = build_stage5_prompt()
+        system_prompt = build_stage5_prompt(
+            char_map=char_map,
+            loc_map=loc_map,
+        )
         model_id = MODEL_POLICY["stage_5"]["model"]
 
         status_area = st.empty()
@@ -958,6 +1540,120 @@ if st.session_state.get("stage_5_result"):
         use_container_width=True,
         key="dl_qa",
     )
+
+
+# ═══════════════════════════════════════════════════
+# ★ v1.1 — LOCALIZATION AUDIT (대조표 잔존 검수)
+# ═══════════════════════════════════════════════════
+st.markdown("---")
+st.markdown("### 🔎 LOCALIZATION AUDIT — 로컬라이징 검수")
+st.caption("대조표가 실제로 반영됐는지 기계적으로 대조합니다. 한글·카타카나 한국명·원화 잔존을 잡아냅니다.")
+
+_audit_source = (
+    st.session_state.get("stage_4_result")
+    or st.session_state.get("stage_3_result")
+    or st.session_state.get("stage_2_result")
+    or st.session_state.get("stage_1_result")
+)
+
+if not (char_map or count_loc_entries(loc_map)):
+    st.caption("⏳ 대조표를 먼저 업로드하세요.")
+elif not _audit_source:
+    st.caption("⏳ 번역 결과가 있어야 검수할 수 있습니다.")
+else:
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        if st.button("🔎 검수 실행", key="btn_audit", use_container_width=True):
+            st.session_state["audit_report"] = check_glossary_residue(
+                _audit_source, char_map, loc_map
+            )
+
+    with col_b:
+        if st.button("🈶 한글 잔존 강제 치환", key="btn_ko_fix", use_container_width=True):
+            fixed, log = apply_korean_residue_fix(_audit_source, char_map, loc_map)
+            st.session_state["enforced_result"] = fixed
+            st.session_state["enforce_log"] = log
+
+    with col_c:
+        if st.button("🛠 구판 오표기 치환", key="btn_enforce", use_container_width=True):
+            fixed, log = apply_glossary_enforcement(_audit_source, loc_map)
+            st.session_state["enforced_result"] = fixed
+            st.session_state["enforce_log"] = log
+
+    # ── 검수 리포트 ──
+    report = st.session_state.get("audit_report")
+    if report:
+        n_unapplied = len(report["unapplied"])
+        n_residue = sum(cnt for _, _, cnt in report["residue"])
+        n_corr = len(report["corrections_left"])
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("한국어 원문 잔존", n_unapplied)
+        m2.metric("패턴 잔존 건수", n_residue)
+        m3.metric("오표기 잔존", n_corr)
+
+        if report["unapplied"]:
+            st.error("**대조표 항목이 한국어 그대로 남아 있습니다** — '한글 잔존 강제 치환'으로 정리할 수 있습니다")
+            st.table([
+                {"분류": g, "한국어": ko, "적용되어야 할 일본어": jp}
+                for ko, jp, g in report["unapplied"][:60]
+            ])
+
+        if report["residue"]:
+            st.warning("**한국 고유 요소 패턴이 검출되었습니다**")
+            st.table([
+                {"유형": label, "검출 예": ", ".join(samples), "건수": cnt}
+                for label, samples, cnt in report["residue"]
+            ])
+
+        if report["corrections_left"]:
+            st.warning("**구판 오표기가 남아 있습니다**")
+            st.table([
+                {"오표기": bad, "확정 표기": good, "건수": n}
+                for bad, good, n in report["corrections_left"][:60]
+            ])
+
+        if report["missing"]:
+            with st.expander(f"⚠️ 확정 일본어가 한 번도 등장하지 않은 항목 ({len(report['missing'])}건)", expanded=False):
+                st.caption("원고에 해당 인물·장소가 아예 안 나오는 경우일 수도 있습니다. 참고용입니다.")
+                st.table([
+                    {"분류": g, "한국어": ko, "확정 일본어": jp}
+                    for ko, jp, g in report["missing"][:80]
+                ])
+
+        if not (report["unapplied"] or report["residue"] or report["corrections_left"]):
+            st.success("✅ 검출된 문제가 없습니다. 로컬라이징이 일관되게 적용되었습니다.")
+
+    # ── 강제 치환 결과 ──
+    if st.session_state.get("enforced_result"):
+        log = st.session_state.get("enforce_log") or []
+        if log:
+            st.success(f"✅ {len(log)}종 · 총 {sum(n for _, _, n in log)}건 치환했습니다.")
+            st.table([
+                {"치환 전": bad, "치환 후": good, "건수": n}
+                for bad, good, n in log
+            ])
+        else:
+            st.info("치환할 항목이 없습니다.")
+
+        st.download_button(
+            "💾 치환본 저장 (TXT)",
+            data=st.session_state["enforced_result"].encode("utf-8"),
+            file_name="localized_enforced_jp.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key="dl_enforced",
+        )
+        if st.button("↪️ 치환본을 최신 결과로 반영", key="btn_apply_enforced", use_container_width=True):
+            for _k in ["stage_4_result", "stage_3_result", "stage_2_result", "stage_1_result"]:
+                if st.session_state.get(_k):
+                    st.session_state[_k] = st.session_state["enforced_result"]
+                    break
+            st.session_state["enforced_result"] = None
+            st.session_state["enforce_log"] = None
+            st.session_state["audit_report"] = None
+            st.rerun()
 
 
 # ═══════════════════════════════════════════════════
@@ -1021,7 +1717,8 @@ if final_result:
     st.markdown("")
     if st.button("🗑️ 전체 초기화 (새 프로젝트)", use_container_width=True):
         for key in ["stage_1_result", "stage_2_result", "stage_3_result",
-                     "stage_4_result", "stage_5_result", "last_error"]:
+                     "stage_4_result", "stage_5_result", "last_error",
+                     "audit_report", "enforced_result", "enforce_log"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
@@ -1033,7 +1730,7 @@ if "last_error" in st.session_state:
 # ── Footer ──
 st.markdown(f"""
 <div class="footer">
-    BLUE JEANS PICTURES — Japanese-Translator v{VERSION}<br>
+    BLUE JEANS PICTURES — Japanese-Translator v{VERSION} ({ENGINE_BUILD_DATE})<br>
     5-Stage Market Adaptation Pipeline · Powered by Anthropic Claude API
 </div>
 """, unsafe_allow_html=True)

@@ -1,5 +1,5 @@
 """
-BLUE JEANS PICTURES — Japanese-Translator v1.0
+BLUE JEANS PICTURES — Japanese-Translator
 prompt.py — Translation Pipeline Prompts & Rule Packs
 
 5-Stage Pipeline:
@@ -11,7 +11,39 @@ prompt.py — Translation Pipeline Prompts & Rule Packs
 
 Output: 企画モード (横書き / Pitch Mode)
 Keigo Tags: keigo / teinei / tameguchi / kenson / ibar
+
+─────────────────────────────────────────────
+CHANGELOG (최신이 위)
+─────────────────────────────────────────────
+v1.1 (2026-09-17)
+  - 기능 추가: 로컬라이징 대조표(XLSX) 통합
+    인물표 CSV/TXT 외에 다중 시트 엑셀 대조표를 읽어
+    ① 주요 인물(일본명·요미가나·대사 헤드) ② 조·단역
+    ③ 지명·기관·고유명사 ④ 법조문·직급까지 한 번에 매핑으로 반영.
+  - 신설 상수: LOCALIZATION_RULES
+    (한국 고유 요소 잔존 금지 — 한글·카타카나 한국명·지명·기관·법령·원화·사건번호·급수)
+  - 신설 함수: build_localization_section()
+  - build_stage1/3/4/5_prompt()에 loc_map 인자 추가
+    (Stage 1~4 매핑 강제 주입, Stage 5 QA 대조 검증)
+  - STAGE_1 RULES 8~10 추가 (룰 번호 1~7 기존 유지)
+  - STAGE_5 체크리스트에 LOCALIZATION 섹션 추가
+  - 신설: ENGINE_VERSION / ENGINE_BUILD_DATE 상수
+    (기존에는 main.py의 VERSION 문자열만 존재)
+
+v1.0
+  - 5-Stage Market Adaptation Pipeline 최초 구성
+  - Style Presets 8종, Keigo Tone Tags 5종
+    (keigo / teinei / tameguchi / kenson / ibar)
+  - 통화 변환 룰(1/10), 문화코드 대응표, 横書き DOCX 출력
 """
+
+# ═══════════════════════════════════════════════════
+# ENGINE VERSION (세만틱 버저닝)
+# ═══════════════════════════════════════════════════
+
+ENGINE_VERSION = "1.1"
+ENGINE_BUILD_DATE = "2026-09-17"
+
 
 # ═══════════════════════════════════════════════════
 # STYLE PRESETS (장르별)
@@ -248,6 +280,58 @@ SCREENPLAY_FORMAT = """
 
 
 # ═══════════════════════════════════════════════════
+# ★ v1.1 — LOCALIZATION RULES
+# 한국 고유 요소 잔존 금지
+# (한글 / 카타카나 한국명 / 지명 / 기관 / 법령 / 원화 / 사건번호 / 급수)
+# ═══════════════════════════════════════════════════
+
+LOCALIZATION_RULES = """
+## LOCALIZATION — NON-NEGOTIABLE
+この脚本は日本に「移し替える」作業であり、字幕翻訳ではない。
+Every Korea-specific element below must be converted to its Japanese counterpart.
+One untranslated Korean element invalidates the entire draft.
+
+### MUST CONVERT
+1. 人名 — 韓国人名は日本人名に置換する。カタカナ音写（キム、パク、ハン、カン）は禁止。
+   姓＋名の日本語表記を使い、初出は フルネーム（年齢、性別）。
+   대사 헤드（人物名）は日本語の姓または与えられた表記で統一。
+2. 地名 — 都市・区・町・通り・ランドマーク・河川敷。
+   （例: ソウル → 東京 / 노원구 → 足立区 / 한강 둔치 → 多摩川河川敷）
+   「ソウル」「セジョン」「ノウォン」等のカタカナ韓国地名は禁止。
+3. 官公庁・機関 — 国税庁、国税局、税務署、検察、裁判所、監察、警察の階級。
+   実在する日本の機関名と組織階層を使う。
+   （例: 서울지방국세청 → 東京国税局 / 중대범죄수사청 → 東京地方検察庁 特別捜査部）
+4. 法令・司法 — 法律名、条文番号、罪名、裁判所の審級、事件番号、令状手続。
+   韓国法の直訳（相続税及び贈与税法、国税基本法、租税犯処罰法）は禁止。
+   日本の実際の法体系（相続税法、国税通則法、国税徴収法、刑法）に対応させる。
+   事件番号は日本式（令和X年（わ）第○○○○号）。
+5. 通貨・単位 — 韓国ウォン → 円（1/10 換算）。
+   「ウォン」「원」「₩」を残さない。漢数字または算用数字＋円で統一。
+6. 公務員の級数 — 韓国式「9급」「8급」は日本に存在しない。
+   採用区分・職名（国税専門官採用、税務職員採用、国税調査官）に置き換える。
+7. 住所・電話番号の書式 — 日本式に。
+8. 企業・ブランド — 韓国財閥・ブランドは日本で通用する等価物または音写名に。
+   作品固有の架空社名は音写を統一（例: 아르카나 체인 → アルカナチェーン）。
+9. 報道・肩書 — ニュース番組名、新聞名、役職名、敬称。
+10. 食・年中行事・習慣 — 日本の読者が翻訳物だと感じない形に置き換える。
+
+### CONSISTENCY LAW
+- 韓国語の1語 = 日本語の1語。作品全体で表記を1つに固定する。
+- LOCALIZATION MAP に載っている語は、必ずマップの表記が優先される。
+- 同じ機関が韓国語で複数の言い方をされていても、日本語表記は1つに統合する。
+
+### FORBIDDEN
+- ハングルの残存（人物名・地名・看板・画面内テキストを含む）
+- カタカナ韓国固有名詞（キム、パク、イ、ハン、カン、チェ、ソウル、セジョン、ノウォン、コエックス）
+- ウォン表記（원 / ウォン / ₩ / "1億ウォン"）
+- 韓国式事件番号（2026고합1234 / 2026コハプ）
+- 韓国の法令名の直訳（相続税及び贈与税法、国税基本法、租税犯処罰法、特定経済犯罪加重処罰法）
+- 韓国式公務員級数（9級、8級）
+- 括弧内の「韓国では〜」という説明書き
+- 同一人物・同一機関に2つ以上の日本語表記"""
+
+
+# ═══════════════════════════════════════════════════
 # STAGE 1: RAW TRANSLATION (Sonnet)
 # ═══════════════════════════════════════════════════
 
@@ -265,14 +349,27 @@ Output in 横書き (horizontal writing) format for pitch/proposal use.
 4. Keep the emotional tone and rhythm of each line.
 5. Dialogue must be natural spoken Japanese — not literary or stiff.
 6. Output ONLY the translated text. No commentary, no notes.
-7. If a Korean expression has no direct Japanese equivalent, choose the closest NATURAL 
+7. If a Korean expression has no direct Japanese equivalent, choose the closest NATURAL
    Japanese phrase that preserves the emotion and intent.
+8. LOCALIZATION IS MANDATORY — this is not a subtitle translation. Korean personal names,
+   place names, government bodies, courts, banks, laws, currency, address formats, case
+   numbers and civil-service grades must be replaced with the Japanese equivalents supplied
+   in the LOCALIZATION MAP. A Korean proper noun left untouched — in Hangul OR in katakana
+   transliteration — is a defect, not a stylistic choice.
+9. Apply the LOCALIZATION MAP to EVERY occurrence — 柱, ト書き, セリフ, 括弧内の演技指示,
+   画面内テキスト, タイトル・字幕, ニュースのV.O., 看板や小道具の文字まで。
+   조·단역（端役・背景人物）carry the same obligation as leads.
+10. Anything Korea-specific NOT in the map must still be localized by inference to Japan,
+   consistently across the whole script. Never leave a katakana transliteration of a Korean
+   proper noun as a placeholder.
 
 ## CHARACTER NAME RULES
 - Apply the character map provided (Korean → Japanese names).
 - First appearance: フルネーム（年齢、性別）.
-- Subsequent mentions: 名前 only (shorter form).
-- Any name NOT in the map: use katakana phonetic rendering.
+- Subsequent mentions: 名前 only (shorter form / 대사 헤드 표기).
+- Any name NOT in the map: invent a natural Japanese name that fits the character's
+  age, class and role, then use that SAME name everywhere. Katakana transliteration of
+  the Korean name (キム, パク, ハン, カン) is FORBIDDEN.
 
 ## WHAT NOT TO DO
 - Do NOT polish or rewrite. That is Stage 3's job.
@@ -478,6 +575,18 @@ Perform a final check on this translated and polished Japanese screenplay.
 - [ ] Cultural codes: adapted for Japanese audience comprehension
 - [ ] No remaining Korean text (unless intentionally kept)
 
+### LOCALIZATION (v1.1)
+- [ ] ハングルの残存なし（人物名・地名・看板・画面内テキストを含む）
+- [ ] カタカナ韓国固有名詞なし（キム / パク / ハン / カン / ソウル / セジョン / ノウォン）
+- [ ] 韓国の官公庁が未変換のまま残っていない（국세청 / 서울지방국세청 / 중대범죄수사청 / 감사원）
+- [ ] 韓国法令の直訳なし（相続税及び贈与税法 / 国税基本法 / 租税犯処罰法）
+- [ ] 事件番号が日本式（令和X年（わ）第○○○○号）
+- [ ] 韓国式公務員級数（9級 / 8級）が残っていない
+- [ ] ウォン表記の残存なし（원 / ウォン / ₩）
+- [ ] LOCALIZATION MAP の全項目が実際に本文へ反映されている
+- [ ] 端役・背景人物もマップに従っている（主要人物だけでない）
+- [ ] 1つの語 = 1つの日本語表記（作品全体で統一）
+
 ### LANGUAGE
 - [ ] No translation artifacts (JP-1 through JP-9)
 - [ ] Natural Japanese dialogue patterns
@@ -507,6 +616,10 @@ KEIGO ISSUES:
 CULTURAL ISSUES:
 - [list any cultural adaptation problems, or "None found"]
 
+LOCALIZATION ISSUES:
+- [list every Korea-specific element still present, quoting it, or "None found"]
+- [list every LOCALIZATION MAP entry that was NOT applied, or "None found"]
+
 LANGUAGE ISSUES:
 - [list any language problems with specific line references, or "None found"]
 
@@ -531,16 +644,25 @@ Be thorough but fair. A score of 8+ means ready for pitch submission to Japanese
 def build_stage1_prompt(
     char_map: dict,
     style_prompt: str,
-    custom_instructions: str = ""
+    custom_instructions: str = "",
+    loc_map: dict = None
 ) -> str:
-    """Build Stage 1 (Raw Translation) system prompt."""
+    """Build Stage 1 (Raw Translation) system prompt. (v1.1 — loc_map 추가)"""
     parts = [STAGE_1_RAW_TRANSLATION]
     parts.append(SCREENPLAY_FORMAT)
     parts.append(CURRENCY_RULE)
     parts.append(CULTURAL_CODE_MAP)
 
+    # ★ v1.1 — Localization rules (always on)
+    parts.append(LOCALIZATION_RULES)
+
     if char_map:
         parts.append(_build_char_map_section(char_map))
+
+    # ★ v1.1 — Localization map (extras / places / legal / corrections)
+    loc_section = build_localization_section(loc_map)
+    if loc_section:
+        parts.append(loc_section)
 
     if style_prompt:
         parts.append(f"\n## TRANSLATION STYLE\n{style_prompt}")
@@ -555,16 +677,25 @@ def build_stage3_prompt(
     char_map: dict,
     char_tones: dict,
     style_prompt: str,
-    custom_instructions: str = ""
+    custom_instructions: str = "",
+    loc_map: dict = None
 ) -> str:
-    """Build Stage 3 (Voice Rewrite) system prompt."""
+    """Build Stage 3 (Voice Rewrite) system prompt. (v1.1 — loc_map 추가)"""
     parts = [STAGE_3_VOICE_REWRITE]
     parts.append(SCREENPLAY_FORMAT)
     parts.append(CURRENCY_RULE)
     parts.append(CULTURAL_CODE_MAP)
 
+    # ★ v1.1 — Localization rules
+    parts.append(LOCALIZATION_RULES)
+
     if char_map:
         parts.append(_build_char_map_section(char_map))
+
+    # ★ v1.1 — Localization map
+    loc_section = build_localization_section(loc_map)
+    if loc_section:
+        parts.append(loc_section)
 
     if char_tones:
         parts.append(_build_tone_section(char_tones))
@@ -582,14 +713,24 @@ def build_stage4_prompt(
     char_map: dict,
     char_tones: dict,
     style_prompt: str,
-    custom_instructions: str = ""
+    custom_instructions: str = "",
+    loc_map: dict = None
 ) -> str:
-    """Build Stage 4 (Dialogue Polish) system prompt."""
+    """Build Stage 4 (Dialogue Polish) system prompt. (v1.1 — loc_map 추가)"""
     parts = [STAGE_4_DIALOGUE_POLISH]
     parts.append(CULTURAL_CODE_MAP)
 
+    # ★ v1.1 — Localization rules
+    parts.append(LOCALIZATION_RULES)
+
     if char_map:
         parts.append(_build_char_map_section(char_map))
+
+    # ★ v1.1 — Localization map
+    loc_section = build_localization_section(loc_map)
+    if loc_section:
+        parts.append(loc_section)
+
     if char_tones:
         parts.append(_build_tone_section(char_tones))
 
@@ -602,11 +743,20 @@ def build_stage4_prompt(
     return "\n".join(parts)
 
 
-def build_stage5_prompt() -> str:
-    """Build Stage 5 (QA Check) system prompt."""
+def build_stage5_prompt(char_map: dict = None, loc_map: dict = None) -> str:
+    """Build Stage 5 (QA Check) system prompt. (v1.1 — loc_map 대조 검증)"""
     parts = [STAGE_5_QA_CHECK]
     parts.append(SCREENPLAY_FORMAT)
     parts.append(CURRENCY_RULE)
+    parts.append(LOCALIZATION_RULES)
+
+    # ★ v1.1 — QA가 대조할 매핑 원본을 함께 전달
+    if char_map:
+        parts.append(_build_char_map_section(char_map))
+    loc_section = build_localization_section(loc_map)
+    if loc_section:
+        parts.append(loc_section)
+
     return "\n".join(parts)
 
 
@@ -622,10 +772,84 @@ def _build_char_map_section(char_map: dict) -> str:
 Replace ALL Korean character names with their Japanese equivalents:
 {char_lines}
 
-Apply to: 柱, ト書き, セリフ, all mentions.
+Apply to: 柱, ト書き, セリフ, 人物名（대사 헤드）, 括弧内の演技指示, 画面内テキスト — all mentions.
 First appearance: フルネーム（年齢、性別）.
 Adapt Korean honorific usage (e.g., "수현아", "지훈씨") into natural Japanese per keigo rules.
-Any name NOT listed: render in katakana."""
+Any name NOT listed: invent a natural Japanese name and use it consistently.
+NEVER transliterate a Korean name into katakana (キム / パク / ハン / カン は禁止)."""
+
+
+def build_localization_section(loc_map: dict) -> str:
+    """Build the LOCALIZATION MAP section for prompts. (v1.1)
+
+    loc_map structure (all keys optional):
+      {
+        "extras":      {korean_term: japanese_term},   # 조·단역
+        "places":      {korean_term: japanese_term},   # 지명·기관·고유명사·통화
+        "legal":       {korean_term: japanese_term},   # 법조문·직급
+        "corrections": {wrong_japanese: correct_japanese},  # 이전 판 오표기 → 확정
+      }
+
+    NOTE: 주요 등장인물(characters)은 _build_char_map_section()이 담당한다.
+          중복 주입을 피하기 위해 이 함수는 characters 키를 출력하지 않는다.
+    """
+    if not loc_map:
+        return ""
+
+    blocks = []
+
+    extras = loc_map.get("extras") or {}
+    if extras:
+        lines = "\n".join([f"  · {ko} → {jp}" for ko, jp in extras.items()])
+        blocks.append(
+            "### 端役・背景人物 — MANDATORY\n"
+            "主要人物と全く同じ義務が課される。例外なし。\n"
+            f"{lines}"
+        )
+
+    places = loc_map.get("places") or {}
+    if places:
+        lines = "\n".join([f"  · {ko} → {jp}" for ko, jp in places.items()])
+        blocks.append(
+            "### 地名・機関・固有名詞・通貨 — MANDATORY\n"
+            "全ての出現箇所で置換する: 柱, ト書き, セリフ, 画面内テキスト, 看板, ニュース原稿。\n"
+            f"{lines}"
+        )
+
+    legal = loc_map.get("legal") or {}
+    if legal:
+        lines = "\n".join([f"  · {ko} → {jp}" for ko, jp in legal.items()])
+        blocks.append(
+            "### 法令・条文・職級 — MANDATORY\n"
+            "韓国法の条文番号をそのまま訳さない。下記の日本法の条文に読み替える。\n"
+            "括弧内の日本語説明はニュアンス指示であり、本文にそのまま書き写さない。\n"
+            f"{lines}"
+        )
+
+    corrections = loc_map.get("corrections") or {}
+    if corrections:
+        lines = "\n".join([f"  · \"{bad}\" → \"{good}\"" for bad, good in corrections.items()])
+        blocks.append(
+            "### 既知の誤表記 — REPLACE ON SIGHT\n"
+            "受け取ったテキストに左側の表記があれば、それは旧稿の誤りである。\n"
+            "全て右側の表記に置き換える。\n"
+            f"{lines}"
+        )
+
+    if not blocks:
+        return ""
+
+    body = "\n\n".join(blocks)
+    return f"""
+## LOCALIZATION MAP — MANDATORY
+This map overrides your own judgment. Every entry must appear in the output
+in its mapped Japanese form, and its Korean/incorrect form must appear nowhere.
+
+{body}
+
+### SELF-CHECK BEFORE OUTPUT
+出力前に自分の原稿を一度走査する。ハングル、カタカナ韓国固有名詞、ウォン表記、
+韓国の官庁名・法令名、上記左側の語が1つでも残っていたら、返す前に直す。"""
 
 
 def _build_tone_section(char_tones: dict) -> str:
