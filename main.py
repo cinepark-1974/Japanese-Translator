@@ -1,1736 +1,1697 @@
-"""
-BLUE JEANS PICTURES — Japanese-Translator
-한국어 시나리오 → 일본어 번역 (5-Stage Market Adaptation Pipeline)
-Powered by Anthropic Claude API
-
-Pipeline:
-  Stage 1: Raw Translation (Sonnet) — 충실한 직역 + 캐릭터/통화/문화 매핑
-  Stage 2: Format Conversion (Rule-based) — 한국 포맷 → 일본 〇柱 포맷
-  Stage 3: Voice Rewrite (Opus) — 번역체 제거, 일본 시나리오 문체
-  Stage 4: Dialogue Polish (Opus) — 경어 설계, 대사 현지화
-  Stage 5: QA Check (Sonnet) — 포맷/경어/문화코드/스토리 검증 리포트
-
-─────────────────────────────────────────────
-CHANGELOG (최신이 위)
-─────────────────────────────────────────────
-v1.1 (2026-09-17)
-  - 로컬라이징 대조표(XLSX) 업로드 지원
-    · 다중 시트 자동 인식 (주요 인물 / 조·단역 / 지명·기관 / 법조문)
-    · 일본어 열 자동 매칭 (일본명·일본판·요미가나·대사 헤드(일))
-    · 일본어 열이 없는 시트(영문 전용)는 자동으로 건너뜀
-    · 다른 시트의 '약칭'을 교차 참조해 극중 축약 호칭도 매핑
-  - loc_map(extras/places/legal/corrections)을 Stage 1·3·4 프롬프트에 강제 주입
-  - Stage 5 QA에 매핑 원본 동봉 → 미적용 항목 지적
-  - 신설: apply_korean_residue_fix() — 남은 한글 고유명사 강제 치환
-  - 신설: apply_glossary_enforcement() — 구판 오표기 일본어 강제 치환
-  - 신설: check_glossary_residue() — 한국 고유 요소 잔존 검수 리포트
-  - 신설 UI: 🔎 LOCALIZATION AUDIT 섹션
-  - VERSION 표기를 prompt.ENGINE_VERSION 단일 출처로 통일
-
-v1.0
-  - 5-Stage Market Adaptation Pipeline 최초 구성
-"""
+# app.py — 너도나도아는커피 숏폼 팩토리 | Streamlit 메인 대시보드
+# Claude API 버전 (Anthropic claude-sonnet-4-6)
 
 import streamlit as st
-import anthropic
-import re
-import io
-import csv
-import json
+import os
 import time
+import base64
+import requests
+from pathlib import Path
 
-from prompt import (
-    ENGINE_VERSION,
-    ENGINE_BUILD_DATE,
-    STYLE_PRESETS,
-    KEIGO_TONE_TAGS,
-    MODEL_POLICY,
-    STAGE_2_FORMAT_RULES,
-    CURRENCY_RULE,
-    CULTURAL_CODE_MAP,
-    build_stage1_prompt,
-    build_stage3_prompt,
-    build_stage4_prompt,
-    build_stage5_prompt,
-)
 
-# ─────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────
+# ── 로고 로드 (base64 임베드) ─────────────────────────────────────────────────
+def _load_logo_b64() -> str:
+    """assets/images/logo.png를 base64로 인코딩해 반환. 없으면 빈 문자열."""
+    logo_path = Path(__file__).parent / "assets" / "images" / "logo.png"
+    if logo_path.exists():
+        with open(logo_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return ""
+
+LOGO_B64 = _load_logo_b64()
+
+
+# ── 구글 드라이브 레퍼런스 이미지 목록 로드 ──────────────────────────────────
+@st.cache_data(ttl=300)  # 5분 캐시 — 새 이미지 추가 후 새로고침하면 반영
+def load_gdrive_images(api_key: str, folder_id: str) -> list[dict]:
+    """
+    공개 구글 드라이브 폴더에서 이미지 파일 목록을 가져온다.
+
+    Args:
+        api_key   : Google API Key (Drive API v3 접근용)
+        folder_id : 드라이브 폴더 ID (URL의 /folders/ 뒤 문자열)
+
+    Returns:
+        [{"name": "파일명.jpg", "url": "공개다운로드URL"}, ...]
+        API 키 / 폴더 ID가 없거나 오류 시 빈 리스트 반환
+    """
+    if not api_key or not folder_id:
+        return []
+
+    try:
+        endpoint = "https://www.googleapis.com/drive/v3/files"
+        params = {
+            "q": (
+                f"'{folder_id}' in parents "
+                "and mimeType contains 'image/' "
+                "and trashed = false"
+            ),
+            "fields": "files(id, name)",
+            "orderBy": "name",
+            "pageSize": 100,
+            "key": api_key,
+        }
+        resp = requests.get(endpoint, params=params, timeout=10)
+        resp.raise_for_status()
+        files = resp.json().get("files", [])
+
+        return [
+            {
+                "name": f["name"],
+                "url": f"https://drive.google.com/uc?export=download&id={f['id']}",
+                "view_url": f"https://drive.google.com/file/d/{f['id']}/view",
+            }
+            for f in files
+        ]
+    except Exception:
+        return []
+
+# ── 페이지 설정 (반드시 첫 번째 st 호출) ─────────────────────────────────────
 st.set_page_config(
-    page_title=f"Japanese-Translator v{ENGINE_VERSION} | BLUE JEANS PICTURES",
-    page_icon="🎌",
+    page_title="☕ 너도나도아는커피 | 숏폼 팩토리",
+    page_icon="☕",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────
-# CUSTOM CSS
-# ─────────────────────────────────────────────
+# ── CSS (Paperlogy 팔레트 — 다크 네이비 사이드바 + 아이스화이트 메인 + 골드앰버) ──
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&display=swap');
+/*
+  ── Paperlogy 팔레트 ───────────────────────────────────────────
+  navy-dark  : #142C3C  (사이드바 배경 · 강조 텍스트)
+  navy-deep  : #0F3B59  (버튼 호버 · 링크)
+  navy-mid   : #1E3A4E  (카드 보더 · 서브 텍스트)
+  gold       : #DBA12C  (포인트 — 씬 번호 · 버튼 · 보더)
+  ice-white  : #F7FBFC  (메인 배경)
+  steel-gray : #C8D6DD  (서브 배경 · 칩)
+  white      : #FFFFFF  (카드 배경)
+  ─────────────────────────────────────────────────────────────
+*/
 
-.stApp { background-color: #F7F7F5 !important; }
+/* ── 전체 배경 ── */
+.stApp { background-color: #F7FBFC; color: #142C3C; }
 
-.main-header {
+/* ── 사이드바 — 다크 네이비 ── */
+section[data-testid="stSidebar"] {
+    background-color: #142C3C !important;
+    border-right: none;
+}
+section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.88) !important; }
+section[data-testid="stSidebar"] .stMarkdown h1,
+section[data-testid="stSidebar"] .stMarkdown h2,
+section[data-testid="stSidebar"] .stMarkdown h3 {
+    color: #FFFFFF !important;
+}
+section[data-testid="stSidebar"] hr {
+    border-color: rgba(255,255,255,0.15) !important;
+}
+/* 사이드바 버튼 — 골드 아웃라인 */
+section[data-testid="stSidebar"] .stButton > button {
+    background: transparent !important;
+    border: 1px solid rgba(219,161,44,0.6) !important;
+    color: rgba(255,255,255,0.88) !important;
+    box-shadow: none !important;
+    text-align: left;
+    font-weight: 500 !important;
+}
+section[data-testid="stSidebar"] .stButton > button:hover {
+    background: rgba(219,161,44,0.15) !important;
+    border-color: #DBA12C !important;
+    color: #FFFFFF !important;
+}
+/* 사이드바 새 프로젝트 버튼 — 골드 솔리드 */
+section[data-testid="stSidebar"] .stButton:first-of-type > button {
+    background: #DBA12C !important;
+    border-color: #DBA12C !important;
+    color: #142C3C !important;
+    font-weight: 700 !important;
+}
+
+/* ── 씬 카드 ── */
+.scene-card {
+    background: #FFFFFF;
+    border: 1.5px solid #C8D6DD;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 8px rgba(20,44,60,0.06);
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+.scene-card:hover {
+    border-color: #DBA12C;
+    box-shadow: 0 4px 16px rgba(20,44,60,0.10);
+}
+
+/* ── 상태 배지 ── */
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+}
+.badge-pending    { background:#EBF1F5; color:#6A8A9A; border:1px solid #C8D6DD; }
+.badge-generating { background:#FDF5E3; color:#A07020; border:1px solid #DBA12C; }
+.badge-done       { background:#E6F4EC; color:#1A6640; border:1px solid #7DC49A; }
+.badge-error      { background:#FDECEA; color:#B03020; border:1px solid #EFA090; }
+
+/* ── 씬 번호 / 이름 ── */
+.scene-num {
+    font-size: 22px;
+    font-weight: 900;
+    color: #DBA12C;
+    line-height: 1;
+}
+.scene-name {
+    font-size: 12px;
+    color: #0F3B59;
+    margin-top: 3px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+/* ── 나레이션 박스 ── */
+.narration-text {
+    font-size: 13px;
+    color: #142C3C;
+    line-height: 1.75;
+    margin: 8px 0;
+    padding: 9px 14px;
+    background: #F7FBFC;
+    border-left: 3px solid #DBA12C;
+    border-radius: 0 6px 6px 0;
+}
+
+/* ── 영문 프롬프트 박스 ── */
+.prompt-text {
+    font-size: 11px;
+    color: #1E3A4E;
+    font-family: monospace;
+    background: #EBF1F5;
+    padding: 6px 10px;
+    border-radius: 6px;
+    word-break: break-all;
+    margin-top: 6px;
+    border: 1px solid #C8D6DD;
+    opacity: 0.85;
+}
+
+/* ── 메타 칩 (SFX / 오버레이) ── */
+.meta-chips { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.chip {
+    font-size: 11px;
+    padding: 2px 9px;
+    border-radius: 12px;
+    background: #C8D6DD;
+    color: #0F3B59;
+    border: 1px solid #B0C4CE;
+    font-weight: 600;
+}
+
+/* ── 스텝 헤더 ── */
+.step-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 20px;
+    background: #FFFFFF;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    border: 1.5px solid #C8D6DD;
+    box-shadow: 0 2px 10px rgba(20,44,60,0.06);
+}
+.step-num {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    background: #DBA12C;
+    color: #142C3C;
+    font-weight: 900;
+    font-size: 15px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    box-shadow: 0 2px 8px rgba(219,161,44,0.35);
+}
+.step-num.done   { background: #142C3C; color: #DBA12C; box-shadow: none; }
+.step-num.locked { background: #C8D6DD; color: #7A9AAA; box-shadow: none; }
+.step-title { font-size: 15px; font-weight: 700; color: #142C3C; }
+.step-sub   { font-size: 12px; color: #4A7A8A; margin-top: 2px; }
+
+/* ── 프로그레스 바 ── */
+div[data-testid="stProgress"] > div > div {
+    background: linear-gradient(90deg, #DBA12C, #F0C050) !important;
+}
+
+/* ── 메인 영역 버튼 — 골드 솔리드 ── */
+.stButton > button {
+    background: #DBA12C !important;
+    color: #142C3C !important;
+    border: none !important;
+    font-weight: 700 !important;
+    border-radius: 8px !important;
+    box-shadow: 0 2px 8px rgba(219,161,44,0.30) !important;
+    transition: background 0.15s, box-shadow 0.15s;
+}
+.stButton > button:hover {
+    background: #C8901A !important;
+    box-shadow: 0 4px 14px rgba(219,161,44,0.45) !important;
+}
+/* ── 비활성(disabled) 버튼 — 명확하게 표시 ── */
+.stButton > button:disabled,
+.stButton > button[disabled] {
+    background: #E8EFF3 !important;
+    color: #8AAABB !important;
+    border: 1.5px solid #C8D6DD !important;
+    box-shadow: none !important;
+    cursor: not-allowed;
+    font-weight: 600 !important;
+}
+
+/* ── 입력 필드 — 라이트 테마 강제 ── */
+.stTextInput > div > div > input {
+    background-color: #FFFFFF !important;
+    color: #142C3C !important;
+    border: 1.5px solid #C8D6DD !important;
+    border-radius: 8px !important;
+}
+.stTextInput > div > div > input:focus {
+    border-color: #DBA12C !important;
+    box-shadow: 0 0 0 2px rgba(219,161,44,0.20) !important;
+}
+.stTextInput > div > div > input::placeholder {
+    color: #9ABBC8 !important;
+}
+
+/* ── 푸터 ── */
+.factory-footer {
     text-align: center;
-    padding: 2.5rem 0 1rem 0;
-}
-.main-header .brand-name {
-    font-size: 0.85rem; color: #191970;
-    letter-spacing: 0.35em; font-weight: 600; margin-bottom: 0.3rem;
-}
-.main-header h1 {
-    font-family: 'Playfair Display', serif;
-    font-size: 2.8rem; font-weight: 900; color: #191970;
-    margin: 0.2rem 0 0; letter-spacing: 0.02em;
-    display: inline-block; border-bottom: 4px solid #f5c842;
-    padding-bottom: 0.3rem;
-}
-.main-header .tagline {
-    font-size: 0.78rem; color: #999;
-    letter-spacing: 0.3em; margin-top: 0.7rem; font-weight: 400;
-}
-.main-header .version-badge {
-    display: inline-block; background: #191970; color: #f5c842;
-    font-size: 0.7rem; padding: 0.15rem 0.6rem; border-radius: 10px;
-    margin-top: 0.5rem; letter-spacing: 0.1em; font-weight: 600;
+    color: #7A9AAA;
+    font-size: 12px;
+    padding: 24px 0 8px;
+    border-top: 1px solid #C8D6DD;
+    margin-top: 16px;
 }
 
-.section-header {
-    background: #f5c842; color: #191970;
-    padding: 0.5rem 1.1rem; border-radius: 6px;
-    font-weight: 700; font-size: 0.95rem;
-    margin: 1.5rem 0 0.8rem 0; letter-spacing: 0.03em;
+/* ── 파이프라인 현황 패널 ── */
+.pipeline-panel {
+    background: #FFFFFF;
+    border: 1.5px solid #C8D6DD;
+    border-radius: 12px;
+    padding: 14px 20px 16px;
+    margin-bottom: 18px;
+    box-shadow: 0 2px 10px rgba(20,44,60,0.06);
+}
+.pipeline-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: #7A9AAA;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+}
+.pipeline-steps {
+    display: flex;
+    gap: 0;
+    align-items: stretch;
+}
+.pipe-step {
+    flex: 1;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #F7FBFC;
+    border: 1.5px solid #C8D6DD;
+    margin-right: 6px;
+    position: relative;
+    min-width: 0;
+}
+.pipe-step:last-child { margin-right: 0; }
+.pipe-step.done {
+    background: #E8F5EE;
+    border-color: #7DC49A;
+}
+.pipe-step.active {
+    background: #FDF5E3;
+    border-color: #DBA12C;
+    box-shadow: 0 0 0 2px rgba(219,161,44,0.20);
+    animation: pulse-border 1.8s ease-in-out infinite;
+}
+.pipe-step.locked {
+    background: #EBF1F5;
+    border-color: #C8D6DD;
+    opacity: 0.65;
+}
+@keyframes pulse-border {
+    0%, 100% { box-shadow: 0 0 0 2px rgba(219,161,44,0.20); }
+    50%       { box-shadow: 0 0 0 4px rgba(219,161,44,0.38); }
+}
+.pipe-icon {
+    font-size: 18px;
+    line-height: 1;
+    margin-bottom: 4px;
+}
+.pipe-label {
+    font-size: 10px;
+    font-weight: 700;
+    color: #1E3A4E;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.pipe-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: #4A7A8A;
+    margin-top: 2px;
+}
+.pipe-step.done .pipe-label  { color: #1A6640; }
+.pipe-step.done .pipe-count  { color: #2E8050; }
+.pipe-step.active .pipe-label { color: #A07020; }
+.pipe-step.active .pipe-count { color: #A07020; }
+.pipe-connector {
+    display: flex;
+    align-items: center;
+    color: #C8D6DD;
+    font-size: 14px;
+    padding: 0 2px;
+    flex-shrink: 0;
 }
 
-.stage-badge {
-    display: inline-block; padding: 0.3rem 0.8rem;
-    border-radius: 15px; font-size: 0.8rem;
-    font-weight: 700; margin: 0.3rem 0.2rem; letter-spacing: 0.02em;
+/* ── 자동새로고침 배지 ── */
+.refresh-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: #FDF5E3;
+    border: 1px solid #DBA12C;
+    border-radius: 16px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #A07020;
 }
-.stage-active { background: #191970; color: #f5c842; }
-.stage-done { background: #2ecc71; color: #fff; }
-.stage-pending { background: #ddd; color: #999; }
-
-.result-box {
-    background: #fff; border: 1px solid #ddd; border-radius: 8px;
-    padding: 1.2rem; font-family: 'Yu Gothic', 'Hiragino Sans', sans-serif;
-    font-size: 0.88rem; line-height: 1.7;
-    white-space: pre-wrap; max-height: 600px; overflow-y: auto;
-}
-
-.qa-box {
-    background: #FFFEF5; border: 2px solid #f5c842; border-radius: 8px;
-    padding: 1.2rem; font-family: 'Courier New', monospace;
-    font-size: 0.85rem; line-height: 1.6;
-    white-space: pre-wrap; max-height: 500px; overflow-y: auto;
-}
-
-.page-chip {
-    display: inline-block; background: #191970; color: #f5c842;
-    padding: 0.2rem 0.7rem; border-radius: 12px;
-    font-size: 0.8rem; font-weight: 600; margin-bottom: 0.5rem;
-}
-
-.char-table {
-    width: 100%; border-collapse: collapse; margin: 0.5rem 0; font-size: 0.85rem;
-}
-.char-table th {
-    background: #191970; color: #f5c842;
-    padding: 0.45rem 0.8rem; text-align: left; font-weight: 600;
-}
-.char-table td {
-    padding: 0.4rem 0.8rem; border-bottom: 1px solid #e8e8e0;
-}
-.char-table tr:nth-child(even) td { background: #EEEEF6; }
-
-.pipeline-info {
-    background: #EEEEF6; border-left: 4px solid #191970;
-    padding: 0.8rem 1rem; border-radius: 0 6px 6px 0;
-    font-size: 0.85rem; margin: 0.5rem 0; color: #333;
-}
-
-.progress-text {
-    text-align: center; color: #666; font-size: 0.85rem; padding: 0.5rem 0;
-}
-
-.footer {
-    text-align: center; color: #bbb; font-size: 0.72rem;
-    margin-top: 2.5rem; padding: 1rem 0;
-    border-top: 1px solid #ddd; letter-spacing: 0.08em;
-}
-
-.stTextInput > div > div > input,
-.stTextArea > div > div > textarea,
-.stSelectbox > div > div { background-color: #fff !important; border-color: #ddd !important; }
-div[data-testid="stFileUploader"] { background-color: #fff !important; border-radius: 8px; }
-.stExpander { background-color: #fff !important; border-color: #ddd !important; border-radius: 8px !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── 소스 모듈 임포트 ─────────────────────────────────────────────────────────
+try:
+    from src.state_manager import StateManager
+    from src.prompts import generate_script_and_prompts
+    from src.image_fal import generate_images_for_scenes, generate_reference_image
+    from src.video_fal import generate_single_clip
+    MODULES_OK = True
+except ImportError as e:
+    MODULES_OK = False
+    IMPORT_ERROR = str(e)
 
-# ─────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────
-MAX_CHARS_PER_PAGE = 8000
-VERSION = ENGINE_VERSION  # prompt.py 단일 출처 — 버전 표기 일원화
+# SEO 키워드 모듈 — 없어도 앱 기동에 영향 없음 (lazy)
+try:
+    from src.seo_keywords import (
+        get_keywords_for_chapter,
+        get_trending_keywords,
+        GRADE_LABEL,
+        ALL_CHAPTERS as SEO_CHAPTERS,
+    )
+    SEO_MODULE_OK = True
+except ImportError:
+    SEO_MODULE_OK = False
 
+# ── 씬별 이미지 소스 판단 ────────────────────────────────────────────────────
+# Claude가 대본 생성 시 scene_type과 visual_source를 함께 결정한다.
+# visual_source: "ai"  → FLUX AI 생성 (인포그래픽·단면도·비교표·추출 시각화)
+# visual_source: "photo" → Unsplash 실사 (산지 풍경·카페 분위기·역사 장면)
+# 구 대본(visual_source 필드 없음) 호환을 위해 scene_type으로 폴백 판단.
+_AI_SCENE_TYPES = {"ASSEMBLY", "MACHINE", "EXTRACTION", "SCIENCE_DATA"}
 
-# ─────────────────────────────────────────────
-# HELPER FUNCTIONS
-# ─────────────────────────────────────────────
-
-# ═══════════════════════════════════════════════════
-# ★ v1.1 — LOCALIZATION WORKBOOK (XLSX 대조표)
-# 한·영·일 대조표에서 '일본어 열'만 골라 매핑을 만든다.
-# ═══════════════════════════════════════════════════
-
-# ── 시트 분류 키워드 (시트명에 포함되면 해당 분류) ──
-_SHEET_EXTRAS_KEYS = ["단역", "조역", "조연", "端役", "extra", "minor", "bit"]
-_SHEET_LEGAL_KEYS = ["법조문", "법령", "법률", "조문", "직급", "법전", "legal"]
-_SHEET_PLACES_KEYS = ["지명", "기관", "장소", "용어", "명칭", "고유명사",
-                      "place", "location", "term"]
-
-# ── 헤더 컬럼 인식 키워드 ──
-_COL_KO_KEYS = ["한국명", "한국이름", "한국판", "한국어", "원문", "국문", "korean"]
-_COL_JP_KEYS = ["일본명", "일본판", "일본어", "일문", "japanese", "日本"]
-# 일본어 열로 오인하면 안 되는 헤더 (역할·비고·요미가나 등)
-_COL_JP_EXCLUDE = ["영문", "english", "요미가나", "로마자", "비고", "대응", "정확도",
-                   "역할", "role", "맥락", "의도", "성별", "출처", "헤드", "연령"]
-_COL_YOMI_KEYS = ["요미가나", "よみ", "読み", "yomi", "가나"]
-_COL_CUE_KEYS = ["대사 헤드", "대사헤드", "cue"]      # 대사 헤드(일) — 극중 호칭 표기
-_COL_SHORT_KEYS = ["약칭", "short"]                   # 극중 축약 호칭 (석훈, 도현 …)
-_COL_TONE_KEYS = ["경어", "톤", "tone", "keigo"]
-_COL_WRONG_KEYS = ["v1", "수정 전", "수정전", "오표기", "before", "직역 상태"]
-
-
-def _norm_header(v) -> str:
-    return str(v or "").strip().lower().replace(" ", "")
-
-
-def _pick_column(headers: list, keys: list, exclude_keys: list = None) -> int:
-    """헤더 리스트에서 키워드에 맞는 컬럼 인덱스를 찾는다. 없으면 -1."""
-    exclude_keys = exclude_keys or []
-    best = -1
-    best_score = -1
-    for idx, h in enumerate(headers):
-        hn = _norm_header(h)
-        if not hn:
-            continue
-        if any(_norm_header(x) in hn for x in exclude_keys):
-            continue
-        for k in keys:
-            if _norm_header(k) in hn:
-                # '확정' / 'v3' 가 붙은 열을 우선한다
-                score = 1
-                if "확정" in hn:
-                    score += 2
-                if "v3" in hn:
-                    score += 1
-                if score > best_score:
-                    best_score = score
-                    best = idx
-    return best
+def needs_ai_image(scene: dict) -> bool:
+    """scene의 visual_source 또는 scene_type으로 AI 이미지 생성 필요 여부 반환."""
+    vs = scene.get("visual_source", "")
+    if vs:
+        return vs == "ai"
+    # 폴백: scene_type 기반
+    return scene.get("scene_type", "") in _AI_SCENE_TYPES
 
 
-def _clean_term(v, strip_kr_note: bool = False) -> str:
-    """셀 값을 문자열로 정리한다.
-
-    strip_kr_note=True 이면 일본어 값 뒤에 붙은 '한글만 들어있는 괄호 주석'을 제거한다.
-    예) "国税調査官（국세전문관 채용）" → "国税調査官"
-        "国税調査官（国税専門官採用）" → 그대로 유지 (일본어 주석은 남긴다)
+def smart_ai_image(scene: dict, fal_key: str, google_key: str) -> tuple:
     """
-    if v is None:
-        return ""
-    t = str(v).strip()
-    if t in {"—", "-", "–", "N/A", "n/a", "없음", "변경 없음", "None"}:
-        return ""
-    if strip_kr_note:
-        # 괄호 안이 한글을 포함하고 일본어(히라가나·가타카나·한자)를 포함하지 않을 때만 제거
-        t = re.sub(
-            r"\s*[（(](?=[^）)]*[가-힣])(?![^）)]*[ぁ-んァ-ヶ一-龥])[^）)]*[）)]",
-            "",
-            t,
-        ).strip()
-        # 설명용 대시 뒤 한글 주석 제거: "相続税法第41条（物納）— 물납재산 순위에 …"
-        t = re.sub(r"\s*[—–]\s*[^—–]*[가-힣][^—–]*$", "", t).strip()
-    return t
+    씬 타입에 따라 최적 AI 엔진으로 이미지를 생성하고 (cdn_url, source_label)을 반환한다.
 
+    라우팅:
+      MACHINE / EXTRACTION / SCIENCE_DATA  →  Gemini Imagen 3 (수채화 스케치)
+      ASSEMBLY                             →  FLUX Pro (포토리얼 음식사진)
+      기타 / google_key 없음               →  FLUX Dev (폴백)
 
-def _has_hangul(s: str) -> bool:
-    return bool(re.search(r"[가-힣]", str(s or "")))
-
-
-def _split_variants(text: str) -> list:
-    """'A / B' 같은 셀을 개별 표기로 분해한다."""
-    if not text:
-        return []
-    out = []
-    for chunk in re.split(r"\s*[/／]\s*", str(text)):
-        chunk = chunk.strip(" .·\t")
-        if chunk and chunk not in out:
-            out.append(chunk)
-    return out
-
-
-def _flexible_pattern(term: str) -> "re.Pattern":
-    """표기 차이를 흡수하는 검색 패턴을 만든다. (v1.1)
-
-    번역 결과물은 괄호( () vs （） ), 중점( · vs ・ ), 대시, 줄바꿈 공백이
-    대조표와 다르게 나오는 경우가 많다. 그 차이로 치환이 누락되지 않도록
-    해당 문자들을 유연하게 매칭한다.
+    Returns:
+        tuple[str, str]: (fal CDN URL, source_label)
+        source_label: "gemini" | "flux"
     """
-    esc = re.escape(str(term))
-    esc = re.sub(r"\\?[（(]", "[（(]", esc)
-    esc = re.sub(r"\\?[）)]", "[）)]", esc)
-    esc = re.sub(r"\\?[・·]", "[・·]", esc)
-    esc = re.sub(r"\\?[-–—−]", "[-–—−]", esc)
-    esc = re.sub(r"(?:\\\s|\s)+", r"\\s*", esc)
-    return re.compile(esc)
+    scene_type = scene.get("scene_type", "")
+    prompt = (scene.get("image_prompt") or scene.get("flow_prompt") or "").strip()
 
+    if scene_type in {"MACHINE", "EXTRACTION", "SCIENCE_DATA"}:
+        from src.image_gptimage2 import generate_illustration_image
+        try:
+            url = generate_illustration_image(
+                fal_key=fal_key,
+                image_prompt=prompt,
+            )
+            return url, "gpt2"
+        except Exception:
+            # GPT Image 2 실패 시 FLUX Dev 일러스트 모드로 폴백
+            from src.image_fal import FLUX_DEV_MODEL, generate_reference_image as _flux_gen
+            url = _flux_gen(fal_key=fal_key, image_prompt=prompt, model=FLUX_DEV_MODEL, illust_mode=True)
+            return url, "flux"
 
-def _is_safe_correction(bad: str, good: str) -> bool:
-    """기계 치환해도 안전한 교정쌍인지 판정한다."""
-    if not bad or not good:
-        return False
-    b, g = str(bad).strip(), str(good).strip()
-    if b == g:
-        return False
-    if b in g:            # 재귀 치환 방지
-        return False
-    if len(b) < 2:
-        return False
-    return True
+    # ASSEMBLY → flux-pro, 그 외 → flux-dev
+    from src.image_fal import FLUX_PRO_MODEL
+    chosen_model = FLUX_PRO_MODEL if scene_type == "ASSEMBLY" else ""
+    url = generate_reference_image(fal_key, prompt, model=chosen_model)
+    return url, "flux"
 
+# ── API 키 로드 ───────────────────────────────────────────────────────────────
+def load_api_keys():
+    """secrets.toml → 환경변수 순으로 API 키 로드"""
+    keys = {}
+    for k in [
+        "ANTHROPIC_API_KEY",
+        "ELEVENLABS_API_KEY",
+        "ELEVENLABS_VOICE_ID",
+        "FAL_KEY",
+        "REPLICATE_API_TOKEN",     # Replicate Wan 2.1 (fal.ai 대안 비디오 백엔드)
+        "UNSPLASH_ACCESS_KEY",     # Unsplash 라이센스 프리 사진 검색용
+        "GOOGLE_API_KEY",          # 구글 드라이브 이미지 목록 조회용 (폴백)
+        "GDRIVE_REF_FOLDER_ID",    # 레퍼런스 이미지 폴더 ID (폴백)
+    ]:
+        try:
+            keys[k] = st.secrets[k]
+        except Exception:
+            keys[k] = os.environ.get(k, "")
+    return keys
 
-def parse_translation_workbook(uploaded_file):
-    """XLSX 로컬라이징 대조표를 파싱한다. (v1.1)
-
-    반환: (char_map, char_tones, loc_map, char_yomi)
-      char_map  : {한국명: 일본명}            — 주요 등장인물 (+약칭 → 대사 헤드)
-      char_tones: {일본명: keigo tag}          — 경어 태그 열이 있을 때
-      loc_map   : {
-            "extras":      {한국명: 일본명},
-            "places":      {한국어 원문: 확정 일본어},
-            "legal":       {한국 법조문: 일본 법조문},
-            "corrections": {구판 오표기 일본어: 확정 일본어},
-        }
-      char_yomi : {일본명: 요미가나}           — UI 표시용
-
-    시트명·헤더명을 키워드로 자동 인식한다.
-    일본어 열이 없는 시트(영문 전용)는 건너뛴다.
-    """
-    try:
-        import openpyxl
-    except ImportError:
-        raise RuntimeError("openpyxl이 설치되어 있지 않습니다. requirements.txt를 확인하세요.")
-
-    data = uploaded_file.read()
-    uploaded_file.seek(0)
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-
-    char_map, char_tones, char_yomi = {}, {}, {}
-    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
-
-    # ── 사전 스캔: 어느 시트에 있든 '한국명 → 약칭'을 모아둔다 ──
-    # (한·영·일 시트에는 약칭 열이 없고, 영문 시트에만 있는 경우가 많다)
-    short_index = {}
-    for ws in wb.worksheets:
-        rows = list(ws.iter_rows(values_only=True))
-        for row in rows[:6]:
-            cand = list(row)
-            ko_i = _pick_column(cand, _COL_KO_KEYS)
-            sh_i = _pick_column(cand, _COL_SHORT_KEYS)
-            if ko_i >= 0 and sh_i >= 0:
-                start = rows.index(row) + 1
-                for r in rows[start:]:
-                    if not r or len(r) <= max(ko_i, sh_i):
-                        continue
-                    ko = _clean_term(r[ko_i])
-                    sh = _clean_term(r[sh_i])
-                    if ko and sh and ko != sh:
-                        short_index.setdefault(ko, sh)
-                break
-
-    # ── 본 스캔 ──
-    for ws in wb.worksheets:
-        sheet_name = str(ws.title).lower()
-
-        if any(k in sheet_name for k in _SHEET_EXTRAS_KEYS):
-            bucket = "extras"
-        elif any(k in sheet_name for k in _SHEET_LEGAL_KEYS):
-            bucket = "legal"
-        elif any(k in sheet_name for k in _SHEET_PLACES_KEYS):
-            bucket = "places"
-        else:
-            bucket = "characters"
-
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            continue
-
-        # 헤더 행 탐색 (앞 6행 안에서 한국어 열과 일본어 열이 모두 잡히는 행)
-        header_idx, headers = -1, []
-        for i, row in enumerate(rows[:6]):
-            cand = list(row)
-            ko_i = _pick_column(cand, _COL_KO_KEYS)
-            jp_i = _pick_column(cand, _COL_JP_KEYS, exclude_keys=_COL_JP_EXCLUDE)
-            if ko_i >= 0 and jp_i >= 0:
-                header_idx, headers = i, cand
-                break
-        if header_idx < 0:
-            # 일본어 열이 없는 시트(영문 전용 등)는 건너뛴다
-            continue
-
-        ko_i = _pick_column(headers, _COL_KO_KEYS)
-        jp_i = _pick_column(headers, _COL_JP_KEYS, exclude_keys=_COL_JP_EXCLUDE)
-        tone_i = _pick_column(headers, _COL_TONE_KEYS)
-        yomi_i = _pick_column(headers, _COL_YOMI_KEYS)
-        cue_i = _pick_column(headers, _COL_CUE_KEYS)
-        short_i = _pick_column(headers, _COL_SHORT_KEYS)
-
-        # 구판 오표기 열: '일본판 (수정 전)' 처럼 '일본'과 함께 있을 때만 인정
-        wrong_i = -1
-        for idx, h in enumerate(headers):
-            hn = _norm_header(h)
-            if not hn or idx == jp_i:
-                continue
-            if any(_norm_header(k) in hn for k in _COL_WRONG_KEYS) and \
-               ("일본" in hn or "japanese" in hn):
-                wrong_i = idx
-                break
-
-        for row in rows[header_idx + 1:]:
-            if not row or len(row) <= max(ko_i, jp_i):
-                continue
-            ko = _clean_term(row[ko_i])
-            jp = _clean_term(row[jp_i], strip_kr_note=True)
-            if not ko or not jp:
-                continue
-
-            if bucket == "characters":
-                char_map[ko] = jp
-
-                if yomi_i >= 0 and len(row) > yomi_i:
-                    yomi = _clean_term(row[yomi_i])
-                    if yomi:
-                        char_yomi[jp] = yomi
-
-                # 약칭(석훈) → 대사 헤드(神崎) 도 매핑에 포함한다.
-                # 원고 본문·대사 헤드에는 약칭이 훨씬 자주 등장한다.
-                cue = _clean_term(row[cue_i], strip_kr_note=True) if (cue_i >= 0 and len(row) > cue_i) else ""
-                short = _clean_term(row[short_i]) if (short_i >= 0 and len(row) > short_i) else ""
-                if not short:
-                    short = short_index.get(ko, "")
-                if short and short not in char_map:
-                    char_map[short] = cue or jp
-
-                if tone_i >= 0 and len(row) > tone_i:
-                    tone = _clean_term(row[tone_i]).lower()
-                    if tone in KEIGO_TONE_TAGS:
-                        char_tones[jp] = tone
-            else:
-                loc_map[bucket][ko] = jp
-
-            # 구판 오표기 → 확정 일본어 (교정 매핑)
-            if wrong_i >= 0 and len(row) > wrong_i:
-                wrong_raw = _clean_term(row[wrong_i])
-                for variant in _split_variants(wrong_raw):
-                    if _is_safe_correction(variant, jp):
-                        loc_map["corrections"][variant] = jp
-
-    return char_map, char_tones, loc_map, char_yomi
-
-
-def count_loc_entries(loc_map: dict) -> int:
-    """loc_map 총 항목 수."""
-    if not loc_map:
-        return 0
-    return sum(len(v or {}) for v in loc_map.values())
-
-
-def _build_ko_jp_pairs(char_map: dict, loc_map: dict) -> list:
-    """한글 → 일본어 기계 치환에 쓸 안전한 쌍 목록을 만든다. (v1.1)
-
-    - 키에 한글이 있어야 한다 (일본어 원고에 한글은 남으면 안 되므로 안전)
-    - 값에 한글이 있으면 제외 (한글을 새로 심는 사고 방지)
-    - 법조문(legal)은 값이 설명형 장문이라 기계 치환에서 제외한다
-    - 'A / B' 형태는 좌우 개수가 맞을 때만 1:1로 분해한다
-    """
-    pairs = []
-    seen = set()
-
-    def add(ko, jp):
-        ko, jp = str(ko).strip(), str(jp).strip()
-        if len(ko) < 2 or not _has_hangul(ko) or _has_hangul(jp) or not jp:
-            return
-        if ko in seen:
-            return
-        seen.add(ko)
-        pairs.append((ko, jp))
-
-    sources = [char_map or {}]
-    if loc_map:
-        sources.append(loc_map.get("extras") or {})
-        sources.append(loc_map.get("places") or {})
-
-    for mapping in sources:
-        for ko, jp in mapping.items():
-            add(ko, jp)
-            ko_parts = _split_variants(ko)
-            jp_parts = _split_variants(jp)
-            if len(ko_parts) > 1 and len(ko_parts) == len(jp_parts):
-                for k, j in zip(ko_parts, jp_parts):
-                    add(k, j)
-
-    # 긴 표기부터 치환해야 부분 일치 사고가 없다 (서울지방국세청 > 서울)
-    pairs.sort(key=lambda x: len(x[0]), reverse=True)
-    return pairs
-
-
-def apply_korean_residue_fix(text: str, char_map: dict, loc_map: dict) -> tuple:
-    """번역 결과에 남은 한글 고유명사를 확정 일본어 표기로 강제 치환한다. (v1.1)
-
-    일본어 원고에 한글이 남아 있으면 그 자체가 결함이므로,
-    대조표에 있는 항목에 한해 기계적으로 치환해도 안전하다.
-
-    반환: (치환된 텍스트, [(한국어, 일본어, 횟수), ...])
-    """
-    if not text:
-        return text, []
-
-    pairs = _build_ko_jp_pairs(char_map, loc_map)
-    if not pairs:
-        return text, []
-
-    log = []
-    placeholders = {}
-
-    for i, (ko, jp) in enumerate(pairs):
-        pattern = _flexible_pattern(ko)
-        found = len(pattern.findall(text))
-        if found:
-            token = f"\x00BJP{i}\x00"
-            text = pattern.sub(token, text)
-            placeholders[token] = jp
-            log.append((ko, jp, found))
-
-    for token, jp in placeholders.items():
-        text = text.replace(token, jp)
-
-    return text, log
-
-
-def apply_glossary_enforcement(text: str, loc_map: dict) -> tuple:
-    """구판 오표기 일본어를 확정 표기로 강제 치환한다. (v1.1)
-
-    반환: (치환된 텍스트, [(오표기, 확정, 횟수), ...])
-    """
-    if not text or not loc_map:
-        return text, []
-
-    corrections = loc_map.get("corrections") or {}
-    if not corrections:
-        return text, []
-
-    log = []
-    placeholders = {}
-
-    for i, bad in enumerate(sorted(corrections.keys(), key=len, reverse=True)):
-        good = corrections[bad]
-        pattern = _flexible_pattern(bad)
-        found = len(pattern.findall(text))
-        if found:
-            token = f"\x00BJC{i}\x00"
-            text = pattern.sub(token, text)
-            placeholders[token] = good
-            log.append((bad, good, found))
-
-    for token, good in placeholders.items():
-        text = text.replace(token, good)
-
-    return text, log
-
-
-# 한국 고유 요소 잔존 탐지 패턴 (일본어 원고 기준)
-_RESIDUE_PATTERNS = [
-    (r"[가-힣]{2,}", "한글 원문 잔존"),
-    (r"(?:ソウル|セジョン|ノウォン|カンナム|チョンノ|イテウォン|ハンガン|"
-     r"コエックス|プサン|インチョン|テグ|クァンジュ)", "카타카나 한국 지명"),
-    (r"(?:キム|パク|チョン|チェ|カン|ハン|ユン|シン|クォン|ミョン|ソン|ペ)"
-     r"[・･\s]?[ァ-ヶー]{2,}", "카타카나 한국식 인명 의심"),
-    (r"(?:オッパ|ヒョン|ヌナ|オンニ|アジョシ|アジュンマ|ソンベ)", "한국식 호칭 미변환"),
-    (r"(?:ウォン|₩)", "원화 표기"),
-    (r"\b(?:Seoul|Sejong|Nowon|Gangnam|Jongno|Itaewon|Hangang)\b", "로마자 한국 지명"),
-    (r"(?:相続税及び贈与税法|国税基本法|租税犯処罰法|特定経済犯罪加重処罰法|"
-     r"公務員行動綱領)", "한국 법령명 직역"),
-    (r"(?:고합|コハプ|コ・ハプ)", "한국식 사건번호"),
-    (r"[89]\s*級(?!数)", "한국식 공무원 급수"),
-    (r"(?:キムチ|ソジュ|マッコリ|サムギョプサル|チゲ|ラミョン)", "미현지화 문화어"),
-]
-
-
-def check_glossary_residue(text: str, char_map: dict, loc_map: dict) -> dict:
-    """번역 결과에 한국 고유 요소·미적용 매핑이 남아있는지 검수한다. (v1.1)
-
-    반환: {
-        "unapplied": [(한국어, 목표 일본어, 분류)],   # 한국어 원문이 그대로 남은 항목
-        "missing":   [(한국어, 목표 일본어, 분류)],   # 목표 일본어가 한 번도 안 나온 항목
-        "residue":   [(라벨, 샘플[:8], 총 건수)],     # 패턴 기반 잔존
-        "corrections_left": [(오표기, 확정, 건수)],
+# ── 세션 상태 초기화 ──────────────────────────────────────────────────────────
+def init_session():
+    defaults = {
+        "current_project": None,   # dict: 현재 열린 프로젝트 state
+        "manager": None,           # StateManager 인스턴스
+        "gen_running": False,       # 생성 중 락
+        "video_threads": {},        # scene_no → Thread
+        "force_refresh": False,    # 버튼 직후 최소 1회 자동갱신 강제
     }
-    """
-    result = {"unapplied": [], "missing": [], "residue": [], "corrections_left": []}
-    if not text:
-        return result
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    buckets = [("주요 인물", char_map or {})]
-    if loc_map:
-        buckets.append(("조·단역", loc_map.get("extras") or {}))
-        buckets.append(("지명·기관·용어", loc_map.get("places") or {}))
-        buckets.append(("법조문·직급", loc_map.get("legal") or {}))
+init_session()
 
-    for label, mapping in buckets:
-        for ko, jp in mapping.items():
-            if ko and ko in text:
-                result["unapplied"].append((ko, jp, label))
-            # 목표 일본어가 전혀 등장하지 않으면 미반영 의심
-            head = re.split(r"\s*[/／]\s*", str(jp))[0].strip()
-            head = re.split(r"[（(]", head)[0].strip()
-            if label != "법조문·직급" and head and len(head) >= 2 and head not in text:
-                result["missing"].append((ko, jp, label))
+# ── StateManager 싱글턴 ───────────────────────────────────────────────────────
+@st.cache_resource
+def get_manager():
+    return StateManager(storage_dir="projects")
 
-    for pattern, label in _RESIDUE_PATTERNS:
-        hits = re.findall(pattern, text)
-        if hits:
-            uniq = []
-            for h in hits:
-                h = str(h).strip()
-                if h and h not in uniq:
-                    uniq.append(h)
-            result["residue"].append((label, uniq[:8], len(hits)))
+# ── 헬퍼: 배지 HTML ───────────────────────────────────────────────────────────
+STATUS_LABEL = {
+    "pending":    ("⏳ 대기", "badge-pending"),
+    "generating": ("⚙️ 생성중", "badge-generating"),
+    "done":       ("✅ 완료", "badge-done"),
+    "error":      ("❌ 오류", "badge-error"),
+}
 
-    corrections = (loc_map or {}).get("corrections") or {}
-    for bad, good in corrections.items():
-        n = len(_flexible_pattern(bad).findall(text))
-        if n:
-            result["corrections_left"].append((bad, good, n))
+def badge_html(status: str) -> str:
+    label, cls = STATUS_LABEL.get(status, ("?", "badge-pending"))
+    return f'<span class="badge {cls}">{label}</span>'
 
-    return result
+# ── 헬퍼: 전체 진행률 계산 ────────────────────────────────────────────────────
+def calc_progress(scenes: list) -> tuple[int, int]:
+    """완료 씬 수, 전체 씬 수"""
+    done = sum(1 for s in scenes if s.get("status") == "done")
+    return done, len(scenes)
 
-# ── END LOCALIZATION HELPERS ──
-
-
-def parse_character_map(uploaded_file) -> tuple:
-    """Parse character name mapping from CSV or TXT file.
-    Supports optional keigo tag and note columns:
-    한국이름,일본이름,경어태그,호칭메모
-    """
-    name = uploaded_file.name.lower()
-
-    # ★ v1.1 — XLSX 로컬라이징 대조표는 전용 파서로 넘긴다
-    if name.endswith((".xlsx", ".xlsm")):
-        cm, ct, _lm, _yomi = parse_translation_workbook(uploaded_file)
-        return cm, ct
-
-    content = uploaded_file.read().decode("utf-8", errors="replace")
-    uploaded_file.seek(0)
-
-    char_map = {}
-    char_tones = {}
-    skip_headers = {"한국이름", "한국명", "korean", "name", "이름"}
-
-    if name.endswith(".csv"):
-        reader = csv.reader(io.StringIO(content))
-        for row in reader:
-            if len(row) >= 2:
-                ko = row[0].strip()
-                jp = row[1].strip()
-                if ko and jp and ko.lower() not in skip_headers:
-                    char_map[ko] = jp
-                    if len(row) >= 3:
-                        tone = row[2].strip().lower()
-                        if tone in KEIGO_TONE_TAGS:
-                            char_tones[jp] = tone
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    # ── 브랜드 로고 ──────────────────────────────────────────────────────────
+    if LOGO_B64:
+        st.markdown(
+            f"""
+            <div style="
+                padding: 20px 16px 12px;
+                text-align: center;
+            ">
+                <img src="data:image/png;base64,{LOGO_B64}"
+                     style="width: 100%; max-width: 200px;
+                            filter: brightness(0) invert(1);
+                            opacity: 0.92;" />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     else:
-        for line in content.strip().split("\n"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            for sep in ["→", "->", "=>", "=", ",", ":", "\t"]:
-                if sep in line:
-                    parts = line.split(sep)
-                    ko = parts[0].strip()
-                    jp = parts[1].strip() if len(parts) > 1 else ""
-                    if ko and jp and ko.lower() not in skip_headers:
-                        char_map[ko] = jp
-                        if len(parts) >= 3:
-                            tone = parts[2].strip().lower()
-                            if tone in KEIGO_TONE_TAGS:
-                                char_tones[jp] = tone
-                    break
+        st.markdown("## ☕ 숏폼 팩토리")
 
-    return char_map, char_tones
+    st.markdown(
+        '<div style="text-align:center; color:rgba(255,255,255,0.5); '
+        'font-size:11px; letter-spacing:0.08em; margin-bottom:12px;">'
+        'SHORTS FACTORY</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
 
+    if not MODULES_OK:
+        st.error(f"모듈 로드 실패\n```\n{IMPORT_ERROR}\n```")
+        st.stop()
 
-def read_uploaded_file(uploaded_file) -> str:
-    """Read text from uploaded .txt, .pdf, or .docx file."""
-    name = uploaded_file.name.lower()
+    manager = get_manager()
 
-    if name.endswith(".txt"):
-        return uploaded_file.read().decode("utf-8", errors="replace")
+    # 새 프로젝트 버튼
+    if st.button("✚ 새 프로젝트 시작", use_container_width=True):
+        st.session_state.current_project = None
+        st.rerun()
 
-    elif name.endswith(".pdf"):
-        try:
-            import pymupdf
-            pdf_bytes = uploaded_file.read()
-            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-            text_parts = []
-            for page in doc:
-                text_parts.append(page.get_text())
-            doc.close()
-            return "\n".join(text_parts)
-        except ImportError:
-            st.error("PDF 처리를 위해 pymupdf가 필요합니다.")
-            return ""
+    st.markdown("#### 기존 프로젝트")
+    projects = manager.list_projects()
 
-    elif name.endswith(".docx"):
-        try:
-            from docx import Document
-            docx_bytes = io.BytesIO(uploaded_file.read())
-            doc = Document(docx_bytes)
-            return "\n".join([p.text for p in doc.paragraphs])
-        except ImportError:
-            st.error("DOCX 처리를 위해 python-docx가 필요합니다.")
-            return ""
-
+    if not projects:
+        st.caption("아직 프로젝트가 없습니다.")
     else:
-        st.error("지원하지 않는 파일 형식입니다. (.txt / .pdf / .docx)")
-        return ""
+        for p in projects:
+            label = p["title"][:40] + ("…" if len(p["title"]) > 40 else "")
+            if st.button(label, key=f"proj_{p['id']}", use_container_width=True):
+                st.session_state.current_project = manager.load_state(p["dir"])
+                st.rerun()
 
+    st.markdown("---")
 
-def split_into_pages(text: str, max_chars: int = MAX_CHARS_PER_PAGE) -> list:
-    """Split text into pages, trying to break at scene boundaries."""
-    if len(text) <= max_chars:
-        return [text]
-
-    pages = []
-    remaining = text
-
-    while remaining:
-        if len(remaining) <= max_chars:
-            pages.append(remaining)
-            break
-
-        chunk = remaining[:max_chars]
-        # 한국어 씬 패턴 + 일본어 〇 패턴
-        scene_pattern = r'\n\s*(?:S\s*#?\s*\d+|씬\s*#?\s*\d+|SCENE\s*\d+|#\s*\d+[\.\)]|INT\.|EXT\.|〇)'
-        matches = list(re.finditer(scene_pattern, chunk))
-
-        if matches:
-            cut_point = matches[-1].start()
-            if cut_point > max_chars * 0.3:
-                pages.append(remaining[:cut_point].rstrip())
-                remaining = remaining[cut_point:].lstrip("\n")
-                continue
-
-        last_break = chunk.rfind("\n\n")
-        if last_break > max_chars * 0.3:
-            pages.append(remaining[:last_break].rstrip())
-            remaining = remaining[last_break:].lstrip("\n")
-        else:
-            pages.append(chunk)
-            remaining = remaining[max_chars:]
-
-    return pages
-
-
-# ─────────────────────────────────────────────
-# STAGE 2: FORMAT CONVERSION (Rule-based)
-# ─────────────────────────────────────────────
-
-def apply_format_conversion(text: str) -> str:
-    """Apply rule-based format conversion: Korean screenplay → Japanese 横書き format."""
-    result = text
-
-    # ── Scene heading: number prefix → 〇 ──
-    # Patterns: "1. INT. ..." / "1. EXT. ..." / "S#1. INT. ..." / "씬1. ..."
-    result = re.sub(
-        r'^(?:\d+\.?\s*|S\s*#?\s*\d+\.?\s*|씬\s*\d+\.?\s*)'
-        r'(?:INT\.\s*/??\s*EXT\.\s*|EXT\.\s*/??\s*INT\.\s*|INT\.\s*|EXT\.\s*)?',
-        '〇',
-        result,
-        flags=re.MULTILINE | re.IGNORECASE
+    # ── JSON 백업 / 복구 ──────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="color:rgba(255,255,255,0.6); font-size:11px; '
+        'margin-bottom:6px;">💾 프로젝트 백업 / 복구</div>',
+        unsafe_allow_html=True,
     )
 
-    # ── Scene heading: dash time → parenthetical time ──
-    # "〇場所 — 時間" → "〇場所（時間）"
-    result = re.sub(
-        r'^(〇.+?)\s*[—–\-]\s*(.+)$',
-        lambda m: f"{m.group(1).rstrip()}（{m.group(2).strip()}）",
-        result,
-        flags=re.MULTILINE
+    # 현재 프로젝트 JSON 다운로드
+    if st.session_state.get("current_project"):
+        import json as _json
+        _proj = st.session_state.current_project
+        _json_bytes = _json.dumps(_proj, ensure_ascii=False, indent=2).encode("utf-8")
+        _filename = f"{_proj.get('title', 'project')[:30]}.json"
+        st.download_button(
+            label="⬇ 현재 프로젝트 JSON 저장",
+            data=_json_bytes,
+            file_name=_filename,
+            mime="application/json",
+            use_container_width=True,
+            key="json_download",
+        )
+    else:
+        st.caption("프로젝트를 선택하면 JSON 저장 버튼이 나타납니다.")
+
+    # JSON 업로드로 복구
+    uploaded_json = st.file_uploader(
+        "⬆ JSON 업로드로 복구",
+        type=["json"],
+        key="json_upload",
+        label_visibility="collapsed",
+    )
+    if uploaded_json is not None:
+        import json as _json
+        try:
+            restored = _json.loads(uploaded_json.read().decode("utf-8"))
+            # projects/ 에 상태 파일 재저장
+            manager.save_state(restored)
+            st.session_state.current_project = restored
+            st.success("복구 완료!")
+            time.sleep(0.5)
+            st.rerun()
+        except Exception as _e:
+            st.error(f"복구 실패: {_e}")
+
+    st.markdown("---")
+    st.markdown(
+        '<div style="text-align:center; color:rgba(255,255,255,0.4); '
+        'font-size:10px; line-height:1.7; padding:4px 0 8px;">'
+        'Claude API · ElevenLabs · Fal.ai Kling<br>'
+        '<span style="color:rgba(219,161,44,0.6);">You & I Know Coffee</span>'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
-    # ── Korean time words → Japanese ──
-    time_map = {
-        "새벽": "夜明け", "아침": "朝", "오전": "午前", "낮": "昼",
-        "오후": "午後", "저녁": "夕方", "밤": "夜", "심야": "深夜",
-        "늦은 오후": "夕方", "늦은 밤": "深夜",
+# ─────────────────────────────────────────────────────────────────────────────
+# API 키 체크
+# ─────────────────────────────────────────────────────────────────────────────
+api_keys = load_api_keys()
+REQUIRED_KEYS = ["ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY"]
+missing = [k for k in REQUIRED_KEYS if not api_keys.get(k)]
+if missing:
+    st.warning(
+        f"API 키가 설정되지 않았습니다: **{', '.join(missing)}**\n\n"
+        "`.streamlit/secrets.toml` 또는 Streamlit Cloud Secrets에 등록해 주세요.",
+        icon="⚠️",
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 새 프로젝트 생성 폼 (프로젝트 미선택 시)
+# ─────────────────────────────────────────────────────────────────────────────
+if st.session_state.current_project is None:
+    # 웰컴 헤더
+    if LOGO_B64:
+        st.markdown(
+            f"""
+            <div style="text-align:center; padding: 32px 0 8px;">
+                <img src="data:image/png;base64,{LOGO_B64}"
+                     style="height: 96px; opacity: 0.9;" />
+                <div style="margin-top:12px; font-size:13px; color:#4A7A8A;
+                            letter-spacing:0.06em;">SHORTS FACTORY</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("## ☕ 너도나도아는커피 숏폼 팩토리")
+
+    st.markdown(
+        '<p style="text-align:center; color:#1E3A4E; font-size:14px; margin:4px 0 24px;">'
+        '챕터와 주제를 입력하면 Claude AI가 12컷 대본을 자동 생성합니다.'
+        '</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+
+    # ── 챕터 목록 (드롭다운) ─────────────────────────────────────────────────
+    CHAPTERS = {
+        "CH01 · 커피의 탄생과 역사":    "CH01 커피의 탄생과 역사",
+        "CH02 · 품종과 원산지":         "CH02 품종과 원산지",
+        "CH03 · 가공 방식 (프로세싱)":  "CH03 가공 방식",
+        "CH04 · 로스팅의 과학":         "CH04 로스팅의 과학",
+        "CH05 · 에스프레소의 원리":     "CH05 에스프레소의 원리",
+        "CH06 · 브루잉 방법론":         "CH06 브루잉 방법론",
+        "CH07 · 아이스 & 시그니처 음료":"CH07 아이스 & 시그니처 음료",
+        "CH08 · 카페 문화와 트렌드":    "CH08 카페 문화와 트렌드",
+        "CH09 · 커피와 건강":           "CH09 커피와 건강",
+        "CH10 · 홈카페 장비 가이드":    "CH10 홈카페 장비 가이드",
+        "─────────────":               None,          # 구분선 역할 (선택 불가)
+        "챕터 없이 주제만으로 생성":    "MISC",
     }
-    for ko_time, jp_time in time_map.items():
-        result = result.replace(f"（{ko_time}）", f"（{jp_time}）")
+    CHAPTER_LABELS = list(CHAPTERS.keys())
 
-    # ── Korean direction markers → Japanese ──
-    marker_map = {
-        r'\(N\)': '（ナレーション）',
-        r'\(나레이션\)': '（ナレーション）',
-        r'\(V\.O\.?\)': '（声のみ）',
-        r'\(O\.S\.?\)': '（OFF）',
-        r'\(소리\)': '（OFF）',
-        r'\(독백\)': '（ナレーション）',
-        r'\(전화\)': '（電話）',
-        r'\(계속\)': '（続き）',
-        r'\(회상\)': '（回想）',
-        r'\(몽타주\)': '（モンタージュ）',
-        r'\(타이틀\)': 'タイトル。',
-        r'\(자막\)': '字幕。',
-    }
-    for pattern, replacement in marker_map.items():
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    # ── session_state: SEO 키워드 클릭 시 topic 자동 채우기 ─────────────────
+    if "seo_selected_topic" not in st.session_state:
+        st.session_state["seo_selected_topic"] = ""
 
-    # ── Transitions ──
-    result = re.sub(r'CUT\s+TO\.?', 'カットバック。', result, flags=re.IGNORECASE)
-    result = re.sub(r'INSERT\s*>', 'インサート＞', result, flags=re.IGNORECASE)
-    result = re.sub(r'FADE\s+IN\s*:', 'フェイドイン。', result, flags=re.IGNORECASE)
-    result = re.sub(r'FADE\s+OUT\.?', 'フェイドアウト。', result, flags=re.IGNORECASE)
-    result = re.sub(r'SMASH\s+CUT\s*:', 'スマッシュカット。', result, flags=re.IGNORECASE)
+    # SEO 버튼 클릭 후 rerun 시 위젯 렌더링 전에 값을 적용 (위젯 충돌 방지)
+    if st.session_state.get("_seo_pending_topic"):
+        st.session_state["topic_text_input"] = st.session_state["_seo_pending_topic"]
+        st.session_state["seo_selected_topic"] = st.session_state["_seo_pending_topic"]
+        del st.session_state["_seo_pending_topic"]
 
-    # ── V.O. in character cues ──
-    result = re.sub(r'\(V\.O\.?\)', '（声のみ）', result)
-    result = re.sub(r'\(O\.S\.?\)', '（OFF）', result)
+    # 주제 입력 — 가장 크게, 맨 위
+    topic = st.text_input(
+        "어떤 커피 이야기를 만들까요?",
+        value=st.session_state.get("seo_selected_topic", ""),
+        placeholder="예: 아이스아메리카노와 롱블랙의 차이   |   예가체프 내추럴 프로세싱의 비밀",
+        help="구체적인 키워드나 질문 형태로 입력할수록 대본 품질이 높아집니다.",
+        key="topic_text_input",
+    )
+    # 직접 타이핑하면 SEO 선택값 초기화 (충돌 방지)
+    if topic != st.session_state.get("seo_selected_topic", ""):
+        st.session_state["seo_selected_topic"] = topic
 
-    return result
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-
-# ─────────────────────────────────────────────
-# API CALL FUNCTION
-# ─────────────────────────────────────────────
-
-def call_api(client, text: str, system_prompt: str, model_id: str,
-             max_tokens: int = 8000, page_info: str = "") -> str:
-    """Call Claude API with streaming to prevent timeout."""
-    full_system = system_prompt
-    if page_info:
-        full_system += f"\n\n[Internal context: {page_info}. Do NOT include this in output.]"
-
-    collected = []
-    with client.messages.stream(
-        model=model_id,
-        max_tokens=max_tokens,
-        system=full_system,
-        messages=[{"role": "user", "content": text}]
-    ) as stream:
-        for text_chunk in stream.text_stream:
-            collected.append(text_chunk)
-
-    return "".join(collected)
-
-
-def run_stage_on_pages(client, pages: list, system_prompt: str,
-                       model_id: str, stage_name: str,
-                       progress_bar, status_area) -> list:
-    """Run an API-based stage on multiple pages with progress tracking."""
-    results = []
-    total = len(pages)
-
-    for idx, page in enumerate(pages):
-        page_num = idx + 1
-        status_area.markdown(
-            f'<div class="progress-text">🔄 {stage_name} — 페이지 {page_num}/{total} 처리 중... (모델: {model_id})</div>',
-            unsafe_allow_html=True
+    # 챕터 선택 — 선택형, 기본값은 "챕터 없이"
+    col_ch, col_gap = st.columns([2, 3])
+    with col_ch:
+        chapter_label = st.selectbox(
+            "챕터 분류 (선택)",
+            options=CHAPTER_LABELS,
+            index=CHAPTER_LABELS.index("챕터 없이 주제만으로 생성"),
+            help="챕터를 선택하면 해당 영역에 맞는 대본이 생성됩니다. 몰라도 괜찮습니다.",
         )
 
-        try:
-            result = call_api(
-                client, page, system_prompt, model_id,
-                page_info=f"Page {page_num} of {total}. Maintain consistency."
-            )
-            results.append(result)
-        except anthropic.APIError as e:
-            error_msg = f"❌ API 오류 ({stage_name}, 페이지 {page_num}): {e}"
-            st.error(error_msg)
-            st.session_state["last_error"] = error_msg
-            return None
-        except Exception as e:
-            error_msg = f"❌ 오류 ({stage_name}, 페이지 {page_num}): {type(e).__name__}: {e}"
-            st.error(error_msg)
-            st.session_state["last_error"] = error_msg
-            return None
+    # 구분선 선택 방지
+    chapter_val = CHAPTERS.get(chapter_label)
+    if chapter_val is None:
+        st.warning("구분선은 선택할 수 없습니다. 다른 챕터를 선택해 주세요.")
+        chapter_val = "MISC"
 
-        progress_bar.progress(page_num / total)
+    # 최종 챕터 문자열
+    chapter = "" if chapter_val == "MISC" else chapter_val
 
-    return results
+    # ── SEO 키워드 추천 UI ────────────────────────────────────────────────────
+    if SEO_MODULE_OK:
+        with st.expander("💡 SEO 인기 키워드 추천 (클릭하면 자동 입력됩니다)", expanded=False):
+            # 탭: 큐레이션 / 실시간
+            tab_bank, tab_live = st.tabs(["📚 검증된 고검색 키워드", "📡 YouTube 실시간 트렌드"])
 
+            with tab_bank:
+                # 챕터가 선택된 경우 해당 챕터 키워드, 아니면 전체 랜덤 표시
+                if chapter and chapter in [v for v in CHAPTERS.values() if v and v != "MISC"]:
+                    # 선택된 챕터명으로 SEO 뱅크 조회
+                    _seo_chapter_key = chapter.split(" ", 1)[-1].strip() if " " in chapter else chapter
+                    _kw_list = get_keywords_for_chapter(_seo_chapter_key)
+                    if not _kw_list:
+                        # 직접 챕터 전체 이름으로 재시도
+                        _kw_list = get_keywords_for_chapter(chapter)
+                else:
+                    # 챕터 미선택 → 모든 챕터에서 A등급만 모아서 표시
+                    _kw_list = []
+                    for _cat_kws in [get_keywords_for_chapter(c) for c in SEO_CHAPTERS]:
+                        _kw_list.extend([k for k in _cat_kws if k["grade"] == "A"])
 
-# ─────────────────────────────────────────────
-# DOCX GENERATION (横書き A4)
-# ─────────────────────────────────────────────
+                if _kw_list:
+                    st.caption("아래 키워드를 클릭하면 주제 입력창에 자동으로 채워집니다.")
+                    _cols = st.columns(2)
+                    for _i, _kw in enumerate(_kw_list):
+                        _grade_tag = GRADE_LABEL.get(_kw["grade"], "")
+                        _label = f"{_grade_tag}  {_kw['topic']}"
+                        with _cols[_i % 2]:
+                            if st.button(_label, key=f"seo_bank_{_i}", use_container_width=True):
+                                st.session_state["_seo_pending_topic"] = _kw["topic"]
+                                st.rerun()
+                else:
+                    st.info("선택한 챕터에 해당하는 키워드 뱅크가 없습니다. 챕터를 선택하거나 직접 입력해 주세요.")
 
-def generate_docx(text: str) -> bytes:
-    """Generate formatted Japanese screenplay DOCX (横書き A4)."""
-    from docx import Document
-    from docx.shared import Pt, Cm
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+            with tab_live:
+                # 씨앗 키워드: 챕터 첫 단어 or 기본값 "커피"
+                _seed_word = chapter.split()[0] if chapter else "커피"
+                st.caption(f"'{_seed_word}' 기준 YouTube 자동완성 실시간 조회")
+                if st.button("🔄 실시간 조회", key="seo_refresh_live"):
+                    st.session_state["seo_live_keywords"] = get_trending_keywords(
+                        _seed_word, max_realtime=8
+                    )
 
-    doc = Document()
+                _live_kws = st.session_state.get("seo_live_keywords", [])
+                if _live_kws:
+                    _live_cols = st.columns(2)
+                    for _j, _kw in enumerate(_live_kws):
+                        _src_tag = "📡" if _kw["source"] == "youtube" else GRADE_LABEL.get(_kw["grade"], "")
+                        _label = f"{_src_tag}  {_kw['topic']}"
+                        with _live_cols[_j % 2]:
+                            if st.button(_label, key=f"seo_live_{_j}", use_container_width=True):
+                                st.session_state["seo_selected_topic"] = _kw["topic"]
+                                st.rerun()
+                else:
+                    st.info("'실시간 조회' 버튼을 눌러 YouTube 트렌드 키워드를 가져오세요.")
 
-    # ── Page Setup: A4 横書き ──
-    section = doc.sections[0]
-    section.page_width = Cm(21.0)
-    section.page_height = Cm(29.7)
-    section.left_margin = Cm(2.0)
-    section.right_margin = Cm(2.0)
-    section.top_margin = Cm(2.0)
-    section.bottom_margin = Cm(2.0)
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    # ── Styles ──
-    style_normal = doc.styles['Normal']
-    style_normal.font.name = 'Yu Gothic'
-    style_normal.font.size = Pt(10.5)
-    style_normal.paragraph_format.space_after = Pt(0)
-    style_normal.paragraph_format.space_before = Pt(0)
-    style_normal.paragraph_format.line_spacing = 1.5
-
-    # Scene heading (柱)
-    style_scene = doc.styles.add_style('Hashira', 1)
-    style_scene.font.name = 'Yu Gothic'
-    style_scene.font.size = Pt(10.5)
-    style_scene.font.bold = True
-    style_scene.paragraph_format.space_before = Pt(24)
-    style_scene.paragraph_format.space_after = Pt(6)
-    style_scene.paragraph_format.line_spacing = 1.5
-
-    # Action (ト書き) — 3字下げ
-    style_action = doc.styles.add_style('Togaki', 1)
-    style_action.font.name = 'Yu Gothic'
-    style_action.font.size = Pt(10.5)
-    style_action.paragraph_format.left_indent = Cm(1.0)  # ~3字下げ
-    style_action.paragraph_format.space_before = Pt(3)
-    style_action.paragraph_format.space_after = Pt(0)
-    style_action.paragraph_format.line_spacing = 1.5
-
-    # Character name (人物名)
-    style_char = doc.styles.add_style('Jinmei', 1)
-    style_char.font.name = 'Yu Gothic'
-    style_char.font.size = Pt(10.5)
-    style_char.font.bold = True
-    style_char.paragraph_format.space_before = Pt(6)
-    style_char.paragraph_format.space_after = Pt(0)
-    style_char.paragraph_format.line_spacing = 1.5
-
-    # Dialogue (セリフ)
-    style_dialog = doc.styles.add_style('Serifu', 1)
-    style_dialog.font.name = 'Yu Gothic'
-    style_dialog.font.size = Pt(10.5)
-    style_dialog.paragraph_format.space_before = Pt(0)
-    style_dialog.paragraph_format.space_after = Pt(0)
-    style_dialog.paragraph_format.line_spacing = 1.5
-
-    # Transition
-    style_trans = doc.styles.add_style('Tenkan', 1)
-    style_trans.font.name = 'Yu Gothic'
-    style_trans.font.size = Pt(10.5)
-    style_trans.paragraph_format.space_before = Pt(6)
-    style_trans.paragraph_format.space_after = Pt(6)
-    style_trans.paragraph_format.line_spacing = 1.5
-
-    # ── Parse and format ──
-    HASHIRA_RE = re.compile(r'^〇')
-    TRANSITION_RE = re.compile(
-        r'^(カットバック|インサート|フェイドイン|フェイドアウト|スマッシュカット|タイトル|字幕|モンタージュ)',
+    start_btn = st.button(
+        "☕ 대본 생성 시작",
+        disabled=(not topic.strip() or not api_keys.get("ANTHROPIC_API_KEY")),
+        use_container_width=False,
     )
-    # セリフ: name「...」 or name（声のみ）「...」
-    SERIFU_RE = re.compile(r'^(.+?)(?:（[^）]*）)?\s*「')
 
-    lines = text.split('\n')
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
+    if start_btn:
+        if not topic.strip():
+            st.error("주제를 입력해 주세요.")
+        else:
+            chapter_for_api = chapter.strip() if chapter.strip() else "MISC"
+            with st.spinner("Claude AI가 12컷 대본을 작성하고 있습니다… (약 20~40초)"):
+                try:
+                    # 프로젝트 디렉터리 생성
+                    new_state = manager.create_new_project(
+                        chapter=chapter_for_api,
+                        topic=topic.strip()
+                    )
+                    # Claude API 호출
+                    result = generate_script_and_prompts(
+                        api_key=api_keys["ANTHROPIC_API_KEY"],
+                        chapter=chapter_for_api,
+                        topic=topic.strip(),
+                    )
+                    # state 업데이트
+                    new_state["full_narration"] = result.get("full_narration", "")
+                    new_state["scenes"] = result.get("scenes", [])
+                    new_state["status"] = "script_ready"
+                    manager.save_state(new_state)
 
-        if not stripped:
-            i += 1
-            continue
+                    st.session_state.current_project = new_state
+                    st.success("대본 생성 완료!")
+                    time.sleep(0.5)
+                    st.rerun()
 
-        # 柱
-        if HASHIRA_RE.match(stripped):
-            doc.add_paragraph(stripped, style='Hashira')
-            i += 1
-            continue
+                except Exception as e:
+                    st.error(f"대본 생성 중 오류가 발생했습니다:\n```\n{e}\n```")
 
-        # 転換
-        if TRANSITION_RE.match(stripped):
-            doc.add_paragraph(stripped, style='Tenkan')
-            i += 1
-            continue
+    st.stop()  # 프로젝트 없을 때는 여기까지
 
-        # セリフ (「」を含む行)
-        if '「' in stripped:
-            # 人物名 + セリフ が同一行
-            m = SERIFU_RE.match(stripped)
-            if m:
-                doc.add_paragraph(stripped, style='Serifu')
-                i += 1
-                continue
+# ─────────────────────────────────────────────────────────────────────────────
+# 프로젝트 대시보드 (프로젝트 선택됨)
+# ─────────────────────────────────────────────────────────────────────────────
+state = st.session_state.current_project
+scenes = state.get("scenes", [])
+done_cnt, total_cnt = calc_progress(scenes)
 
-        # ト書き (default)
-        doc.add_paragraph(stripped, style='Togaki')
-        i += 1
+# ── 상단 헤더 ─────────────────────────────────────────────────────────────────
+st.markdown(f"## [{state.get('chapter','')}] {state.get('topic','')}")
 
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
+col_info, col_reload = st.columns([6, 1])
+with col_info:
+    st.caption(
+        f"프로젝트 ID: `{state.get('project_id','')}` · "
+        f"상태: `{state.get('status','')}` · "
+        f"영상 진행: **{done_cnt}/{total_cnt}**컷 완료"
+    )
+with col_reload:
+    if st.button("🔄 새로고침"):
+        try:
+            refreshed = manager.load_state(state["project_dir"])
+            st.session_state.current_project = refreshed
+        except Exception:
+            pass
+        st.rerun()
+
+if total_cnt > 0:
+    st.progress(done_cnt / total_cnt)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 파이프라인 현황 패널 (모든 단계 한눈에)
+# ─────────────────────────────────────────────────────────────────────────────
+img_done_cnt_panel = sum(1 for s in scenes if s.get("image_status") == "done")
+img_generating     = any(s.get("image_status") == "generating" for s in scenes)
+vid_generating     = any(s.get("status") == "generating" for s in scenes)
+
+any_generating = img_generating or vid_generating or st.session_state.get("force_refresh", False)
 
 
-# ═══════════════════════════════════════════════════
-# UI
-# ═══════════════════════════════════════════════════
+def _pipe_cls(done: bool, active: bool, locked: bool) -> str:
+    if done:   return "done"
+    if active: return "active"
+    if locked: return "locked"
+    return ""
 
-# ── Header ──
+
+def _pipe_icon(done: bool, active: bool, locked: bool) -> str:
+    if done:   return "✅"
+    if active: return "⚙️"
+    if locked: return "🔒"
+    return "⏳"
+
+
+p1_done   = bool(scenes)
+p1_active = False
+p1_locked = False
+
+p2_done   = (img_done_cnt_panel == total_cnt and total_cnt > 0)
+p2_active = img_generating
+p2_locked = not p1_done
+
+p3_done   = bool(state.get("audio_path"))
+p3_active = False
+p3_locked = not p1_done
+
+p4_done   = (done_cnt == total_cnt and total_cnt > 0)
+p4_active = vid_generating
+p4_locked = not p1_done
+
+p5_done   = bool(state.get("final_video_path"))
+p5_active = False
+p5_locked = done_cnt < total_cnt or total_cnt == 0 or not state.get("audio_path")
+
+
+def _pipe_step_html(icon, label, count_str, cls):
+    return (
+        f'<div class="pipe-step {cls}">'
+        f'<div class="pipe-icon">{icon}</div>'
+        f'<div class="pipe-label">{label}</div>'
+        f'<div class="pipe-count">{count_str}</div>'
+        f'</div>'
+    )
+
+
+refresh_badge = ""
+if any_generating:
+    refresh_badge = '<span class="refresh-badge">⚙️ 생성 중 · 자동 새로고침</span>'
+
+s1 = _pipe_step_html(_pipe_icon(p1_done,p1_active,p1_locked), "① 대본",   "완료" if p1_done else "대기",                              _pipe_cls(p1_done,p1_active,p1_locked))
+s2 = _pipe_step_html(_pipe_icon(p2_done,p2_active,p2_locked), "② 이미지", f"{img_done_cnt_panel}/{total_cnt}컷" if not p2_locked else "잠금", _pipe_cls(p2_done,p2_active,p2_locked))
+s3 = _pipe_step_html(_pipe_icon(p3_done,p3_active,p3_locked), "③ 음성",   "완료" if p3_done else ("대기" if p3_locked else "준비중"),         _pipe_cls(p3_done,p3_active,p3_locked))
+s4 = _pipe_step_html(_pipe_icon(p4_done,p4_active,p4_locked), "④ 영상",   f"{done_cnt}/{total_cnt}컷" if not p4_locked else "잠금",           _pipe_cls(p4_done,p4_active,p4_locked))
+s5 = _pipe_step_html(_pipe_icon(p5_done,p5_active,p5_locked), "⑤ 합성",   "완료" if p5_done else ("잠금" if p5_locked else "대기"),           _pipe_cls(p5_done,p5_active,p5_locked))
+
+panel_html = (
+    '<div class="pipeline-panel">'
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
+    '<div class="pipeline-title">⚡ 파이프라인 현황</div>'
+    f'{refresh_badge}'
+    '</div>'
+    f'<div class="pipeline-steps">{s1}{s2}{s3}{s4}{s5}</div>'
+    '</div>'
+)
+st.markdown(panel_html, unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — 대본 (항상 표시, 완료 상태)
+# ─────────────────────────────────────────────────────────────────────────────
+step1_done = bool(scenes)
+
+step1_cls  = "done" if step1_done else ""
 st.markdown(f"""
-<div class="main-header">
-    <div class="brand-name">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-    <h1>JAPANESE-TRANSLATOR</h1>
-    <div class="tagline">Y O U N G &nbsp; · &nbsp; V I N T A G E &nbsp; · &nbsp; F R E E &nbsp; · &nbsp; I N N O V A T I V E</div>
-    <div class="version-badge">v{VERSION} — 5-Stage Market Adaptation Pipeline</div>
+<div class="step-header">
+  <div class="step-num {step1_cls}">{"✓" if step1_done else "1"}</div>
+  <div>
+    <div class="step-title">STEP 1 · 대본 생성 (Claude API)</div>
+    <div class="step-sub">{"12컷 대본 · Kling 영문 프롬프트 · SFX 태그 완성" if step1_done else "대본을 아직 생성하지 않았습니다."}</div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("---")
+if step1_done:
+    with st.expander("전체 나레이션 원고 보기", expanded=False):
+        st.markdown(f"""
+        <div style="
+            background:#130f0b; border-left:4px solid #c8a96e;
+            padding:16px 20px; border-radius:0 8px 8px 0;
+            font-size:14px; line-height:1.8; color:#d4cfc8;
+            white-space:pre-wrap;
+        ">{state.get('full_narration','(없음)')}</div>
+        """, unsafe_allow_html=True)
 
-# ── API Key ──
-api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-if api_key:
-    st.success("🔑 API Key 연결됨 (Secrets)")
-else:
-    api_key = st.text_input(
-        "🔑 Anthropic API Key",
-        type="password",
-        help="Claude API 키를 입력하세요. (sk-ant-...)"
-    )
-
-# ═══════════════════════════════════════════════════
-# SETTINGS PANEL
-# ═══════════════════════════════════════════════════
-
-st.markdown('<div class="section-header">⚙️ SETTINGS — 번역 설정</div>', unsafe_allow_html=True)
-
-# ── Style ──
-st.markdown("**장르 스타일**")
-style_choice = st.selectbox(
-    "장르/스타일 프리셋:",
-    list(STYLE_PRESETS.keys()),
-    index=0,
-    label_visibility="collapsed",
-)
-selected_style = STYLE_PRESETS[style_choice]
-st.caption(f"📌 {selected_style['desc']}")
-
-# ── Custom Instructions ──
-custom_instructions = st.text_area(
-    "✏️ 추가 번역 지시사항 (선택)",
-    height=80,
-    placeholder="예: 특정 용어는 이렇게 번역해줘 / 경어 레벨을 이렇게 조정해줘...",
-)
-
-# ── Pipeline Info ──
-st.markdown(
-    '<div class="pipeline-info"><strong>5-Stage Market Adaptation Pipeline:</strong><br>'
-    'Stage 1: Raw Translation → Sonnet (직역 + 캐릭터/통화/문화 매핑)<br>'
-    'Stage 2: Format Conversion → 규칙 기반 (무료, 〇柱 포맷 변환)<br>'
-    'Stage 3: Voice Rewrite → Opus (번역체 제거, 일본 시나리오 문체)<br>'
-    'Stage 4: Dialogue Polish → Opus (경어 설계, 대사 현지화)<br>'
-    'Stage 5: QA Check → Sonnet (포맷/경어/문화코드/스토리 검증)<br>'
-    '<br>💡 각 단계별로 독립 실행 · 결과 저장 · 이어서 진행 가능<br>'
-    '🔎 대조표를 올리면 Stage 1·3·4에 매핑이 강제 주입되고, 하단 LOCALIZATION AUDIT에서 잔존 검수가 가능합니다.</div>',
-    unsafe_allow_html=True
-)
-
-
-# ═══════════════════════════════════════════════════
-# CHARACTER MAP
-# ═══════════════════════════════════════════════════
-
-st.markdown('<div class="section-header">👤 LOCALIZATION MAP — 로컬라이징 대조표</div>', unsafe_allow_html=True)
-
-st.info(
-    "💡 **XLSX 대조표**를 올리면 주요 인물 · 조단역 · 지명/기관/고유명사 · 법조문까지 한 번에 반영됩니다. "
-    "한·영·일 대조표를 그대로 올리면 일본어 열만 자동으로 읽습니다. "
-    "기존 CSV/TXT 인물표도 그대로 사용할 수 있습니다."
-)
-
-char_map_file = st.file_uploader(
-    "대조표 파일 업로드",
-    type=["xlsx", "xlsm", "csv", "txt"],
-    help="XLSX: 다중 시트 대조표 (권장) | CSV: 한국이름,일본이름,경어태그 | TXT: 한국이름 → 일본이름",
-    key="char_map_upload"
-)
-
-char_map = {}
-char_tones = {}
-char_yomi = {}
-loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
-
-if char_map_file:
-    fname = char_map_file.name.lower()
-    try:
-        if fname.endswith((".xlsx", ".xlsm")):
-            char_map, char_tones, loc_map, char_yomi = parse_translation_workbook(char_map_file)
-        else:
-            char_map, char_tones = parse_character_map(char_map_file)
-    except Exception as e:
-        st.error(f"❌ 대조표를 읽는 중 오류가 발생했습니다: {e}")
-        char_map, char_tones = {}, {}
-
-    if char_map or count_loc_entries(loc_map):
-        # 세션에 저장 (재업로드 없이 유지)
-        st.session_state["saved_char_map"] = char_map
-        st.session_state["saved_char_tones"] = char_tones
-        st.session_state["saved_loc_map"] = loc_map
-        st.session_state["saved_char_yomi"] = char_yomi
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("주요 인물", f"{len(char_map)}")
-        c2.metric("조·단역", f"{len(loc_map.get('extras') or {})}")
-        c3.metric("지명·기관·용어", f"{len(loc_map.get('places') or {})}")
-        c4.metric("법조문·직급", f"{len(loc_map.get('legal') or {})}")
-
-        st.success(
-            f"✅ 총 {len(char_map) + count_loc_entries(loc_map)}건 로드 "
-            f"· 경어 태그 {len(char_tones)}건"
-        )
-
-        with st.expander("📑 로드된 매핑 확인", expanded=False):
-            tab1, tab2, tab3, tab4 = st.tabs(
-                ["주요 인물", "조·단역", "지명·기관·용어", "법조문·직급"]
-            )
-            with tab1:
-                if char_map:
-                    rows = []
-                    for ko, jp in char_map.items():
-                        tone = char_tones.get(jp, "—")
-                        tone_label = KEIGO_TONE_TAGS[tone]["label"] if tone in KEIGO_TONE_TAGS else "—"
-                        yomi = char_yomi.get(jp, "")
-                        rows.append(
-                            f"<tr><td>{ko}</td><td>→</td><td><strong>{jp}</strong></td>"
-                            f"<td>{yomi}</td><td>{tone_label}</td></tr>"
+    # 대본 재생성 버튼 (경고 모달)
+    with st.expander("⚠️ 대본 전체 재생성"):
+        st.warning("대본을 다시 생성하면 모든 씬 상태가 초기화됩니다.")
+        if st.button("대본 재생성 실행", key="regen_script"):
+            if not api_keys.get("ANTHROPIC_API_KEY"):
+                st.error("ANTHROPIC_API_KEY가 없습니다.")
+            else:
+                with st.spinner("재생성 중…"):
+                    try:
+                        result = generate_script_and_prompts(
+                            api_key=api_keys["ANTHROPIC_API_KEY"],
+                            chapter=state["chapter"],
+                            topic=state["topic"],
                         )
-                    st.markdown(f"""
-                    <table class="char-table">
-                        <tr><th>한국이름</th><th></th><th>日本語名</th><th>よみ</th><th>敬語レベル</th></tr>
-                        {"".join(rows)}
-                    </table>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.caption("없음")
-            with tab2:
-                extras = loc_map.get("extras") or {}
-                if extras:
-                    st.table([{"한국어": k, "日本語": v} for k, v in extras.items()])
-                else:
-                    st.caption("없음")
-            with tab3:
-                places = loc_map.get("places") or {}
-                if places:
-                    st.table([{"한국어 원문": k, "확정 일본어": v} for k, v in places.items()])
-                else:
-                    st.caption("없음")
-            with tab4:
-                legal = loc_map.get("legal") or {}
-                if legal:
-                    st.caption("법조문은 프롬프트 참조용으로만 전달되며, 기계 치환 대상이 아닙니다.")
-                    st.table([{"한국판 근거": k, "일본판 조문": v} for k, v in legal.items()])
-                else:
-                    st.caption("없음")
+                        state["full_narration"] = result.get("full_narration", "")
+                        state["scenes"] = result.get("scenes", [])
+                        state["status"] = "script_ready"
+                        state["audio_path"] = ""
+                        state["final_video_path"] = ""
+                        manager.save_state(state)
+                        st.session_state.current_project = state
+                        st.success("재생성 완료!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"오류: {e}")
 
-        if loc_map.get("corrections"):
-            with st.expander(f"🛠 구판 오표기 교정 매핑 ({len(loc_map['corrections'])}건)", expanded=False):
-                st.table([{"오표기": k, "확정 표기": v} for k, v in loc_map["corrections"].items()])
+st.markdown("---")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — 레퍼런스 이미지 생성 (FLUX Schnell)
+# ─────────────────────────────────────────────────────────────────────────────
+step2_locked = not step1_done
+img_done_cnt  = img_done_cnt_panel   # 위에서 계산
+step2_done    = p2_done
+
+_unsplash_key = api_keys.get("UNSPLASH_ACCESS_KEY", "")
+_img_src_label = "Unsplash · FLUX AI 선택 가능" if _unsplash_key else "FLUX Schnell (AI 생성)"
+
+st.markdown(f"""
+<div class="step-header">
+  <div class="step-num {"done" if step2_done else ("locked" if step2_locked else "")}">
+    {"✓" if step2_done else "2"}
+  </div>
+  <div>
+    <div class="step-title">STEP 2 · 레퍼런스 이미지 ({_img_src_label})</div>
+    <div class="step-sub">
+      {"12컷 이미지 완성 — Kling 첫 프레임 준비됨" if step2_done
+        else ("STEP 1 대본 생성 후 진행하세요." if step2_locked
+              else f"씬별 구도 이미지를 자동 수집합니다. ({img_done_cnt}/{total_cnt}컷 완료)")}
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+BATCH_SIZE = 4   # 이미지: 4장 × 3회 = 12컷
+
+if not step2_locked:
+    pending_imgs  = [s for s in scenes if s.get("image_status") in ("pending", "error")]
+    next_batch    = pending_imgs[:BATCH_SIZE]
+    batch_nos     = [s["scene_no"] for s in next_batch]
+    batch_label   = f"{batch_nos[0]}~{batch_nos[-1]}컷" if batch_nos else ""
+
+    # ── 이미지 생성 모드 선택 ────────────────────────────────────────────────
+    if _unsplash_key:
+        _mode_options = [
+            "🎯 자동 판단 (씬별 최적 소스)",
+            "📷 모두 Unsplash 실사",
+            "🤖 모두 FLUX AI",
+        ]
     else:
-        st.warning(
-            "⚠️ 매핑을 읽을 수 없습니다. 시트 헤더에 '한국명'(또는 '한국판 원문')과 "
-            "'일본명'(또는 '일본판') 열이 있는지 확인해 주세요."
-        )
+        _mode_options = ["🤖 FLUX AI 생성 (인포그래픽 · 3D · 단면도)"]
 
-# 대조표를 다시 올리지 않아도 세션 보관본을 사용한다
-if not char_map and st.session_state.get("saved_char_map"):
-    char_map = st.session_state.get("saved_char_map") or {}
-    char_tones = st.session_state.get("saved_char_tones") or {}
-    loc_map = st.session_state.get("saved_loc_map") or loc_map
-    char_yomi = st.session_state.get("saved_char_yomi") or {}
-    st.caption(
-        f"↩️ 이전 매핑 사용 중 — 인물 {len(char_map)}건 · 기타 {count_loc_entries(loc_map)}건"
+    _img_mode = st.radio(
+        "이미지 소스",
+        options=_mode_options,
+        horizontal=True,
+        key="img_mode_radio",
+        label_visibility="collapsed",
     )
+    _mode_is_auto  = _unsplash_key and "자동" in _img_mode
+    _use_unsplash_batch = _unsplash_key and "Unsplash" in _img_mode
 
-# Manual keigo assignment
-if char_map and not char_tones:
-    with st.expander("🎭 캐릭터별 경어 태그 수동 설정 (선택)"):
-        st.caption("CSV 3번째 열 없이 여기서 직접 설정할 수 있어요.")
-        for ko, jp in char_map.items():
-            tone = st.selectbox(
-                f"{jp}",
-                ["—", "keigo", "teinei", "tameguchi", "kenson", "ibar"],
-                index=0,
-                key=f"tone_{jp}",
-            )
-            if tone != "—":
-                char_tones[jp] = tone
-
-with st.expander("📋 XLSX 대조표 양식 안내", expanded=False):
-    st.markdown("""
-**시트 구성** — 시트명에 아래 단어가 들어가면 자동 분류됩니다.
-
-| 시트명 예시 | 분류 | 인식 키워드 |
-|---|---|---|
-| 한·영·일 이름 대조 | 주요 인물 | (그 외 전부) |
-| 조·단역 한영일 | 조·단역 | 단역 · 조역 · 조연 |
-| 일본판 지명·기관·고유명사 | 지명·기관·용어 | 지명 · 기관 · 장소 · 용어 · 명칭 · 고유명사 |
-| 일본판 법조문 | 법조문·직급 | 법조문 · 법령 · 법률 · 조문 · 직급 |
-
-**열 구성** — 헤더 이름으로 자동 인식합니다. 순서는 상관없습니다.
-
-| 열 | 인식 키워드 | 용도 |
-|---|---|---|
-| 한국명 / 한국판 원문 / 한국판 근거 | 한국명 · 한국이름 · 한국판 · 원문 | 치환 대상 |
-| 일본명 (한자) / 일본판 (확정안) | 일본명 · 일본판 · 일본어 | 확정 표기 |
-| 요미가나 | 요미가나 · 読み | 표시용 (프롬프트 미주입) |
-| 대사 헤드(일) | 대사 헤드 · cue | 약칭과 짝지어 극중 호칭으로 매핑 |
-| 약칭 | 약칭 | 다른 시트에 있어도 한국명으로 교차 참조 |
-| 경어태그 | 경어 · 톤 · keigo | keigo / teinei / tameguchi / kenson / ibar |
-
-- **영문 열만 있는 시트는 자동으로 건너뜁니다.** 한·영·일 통합 대조표를 그대로 올리면 됩니다.
-- `역할 (일본판)` `비고` `대응 정확도` 처럼 표기가 아닌 열은 매핑에 쓰이지 않습니다.
-- 일본어 값 뒤의 **한글 전용 괄호 주석**은 자동 제거됩니다. (일본어 괄호 주석은 유지)
-""")
-
-with st.expander("📋 CSV / TXT 인물표 예시 보기"):
-    st.code("""# CSV 형식 — 4열: 한국이름, 일본이름, 경어태그, 호칭메모(선택)
-한국이름,일본이름,경어태그,호칭메모
-김지훈,中村智弘,teinei,松田には敬語
-이수현,林美咲,teinei,智弘とは距離がある
-박성태,杉山正道,ibar,タメ口+命令形
-박 경위,松田警部補,tameguchi,職務的タメ口
-
-# TXT 형식
-김지훈 → 中村智弘 → teinei
-박성태 → 杉山正道 → ibar""", language="text")
-
-
-# ═══════════════════════════════════════════════════
-# INPUT
-# ═══════════════════════════════════════════════════
-
-st.markdown('<div class="section-header">📥 INPUT — 시나리오 입력 (한국어)</div>', unsafe_allow_html=True)
-
-project_title = st.text_input(
-    "🎬 프로젝트 제목 (파일명에 사용됩니다)",
-    value=st.session_state.get("project_title", ""),
-    placeholder="예: 水姫, 물귀신, TAKEOFF...",
-    help="다운로드 파일명이 Screenplay_제목_JP 형태로 생성됩니다.",
-)
-if project_title:
-    st.session_state["project_title"] = project_title
-
-input_method = st.radio(
-    "입력 방식:",
-    ["📎 파일 업로드", "📝 텍스트 붙여넣기"],
-    horizontal=True,
-)
-
-source_text = ""
-
-if input_method == "📎 파일 업로드":
-    uploaded = st.file_uploader(
-        "시나리오 파일을 업로드하세요",
-        type=["txt", "pdf", "docx"],
-        help=".txt / .pdf / .docx 파일 지원",
-        key="screenplay_upload"
-    )
-    if uploaded:
-        with st.spinner("파일 읽는 중..."):
-            source_text = read_uploaded_file(uploaded)
-        if source_text:
-            import os
-            raw_name = os.path.splitext(uploaded.name)[0]
-            clean_title = re.sub(r'[\s_-]+', '_', raw_name).strip('_')
-            st.session_state["project_title"] = clean_title
-            st.success(f"✅ 파일 로드 완료 — {len(source_text):,}자")
-            with st.expander("📄 원문 미리보기", expanded=False):
-                st.text(source_text[:3000] + ("..." if len(source_text) > 3000 else ""))
-else:
-    if "paste_pages" not in st.session_state:
-        st.session_state.paste_pages = 1
-
-    col_add, col_remove = st.columns([1, 1])
-    with col_add:
-        if st.button("➕ 페이지 추가", use_container_width=True):
-            st.session_state.paste_pages += 1
-            st.rerun()
-    with col_remove:
-        if st.session_state.paste_pages > 1:
-            if st.button("➖ 페이지 제거", use_container_width=True):
-                st.session_state.paste_pages -= 1
-                st.rerun()
-
-    page_texts = []
-    for i in range(st.session_state.paste_pages):
-        st.markdown(f'<span class="page-chip">Page {i+1}</span>', unsafe_allow_html=True)
-        txt = st.text_area(
-            f"시나리오 텍스트 (페이지 {i+1})",
-            height=250,
-            key=f"paste_page_{i}",
-            placeholder=f"페이지 {i+1}의 시나리오 텍스트를 붙여넣으세요...",
-            label_visibility="collapsed"
+    col_img, col_img_info = st.columns([2, 5])
+    with col_img:
+        _src_icon = "📷" if _use_unsplash_batch else "🤖"
+        img_gen_btn = st.button(
+            f"{_src_icon} 다음 {len(next_batch)}컷 ({batch_label})" if next_batch else "✅ 이미지 완료",
+            disabled=(len(next_batch) == 0 or st.session_state.gen_running),
+            key="img_gen_all",
         )
-        page_texts.append(txt)
-
-    source_text = "\n\n".join([t for t in page_texts if t.strip()])
-    if source_text:
-        st.caption(f"총 {len(source_text):,}자 입력됨")
-
-
-# ═══════════════════════════════════════════════════
-# STEP-BY-STEP PIPELINE
-# ═══════════════════════════════════════════════════
-
-st.markdown('<div class="section-header">🔄 PIPELINE — 단계별 실행</div>', unsafe_allow_html=True)
-
-can_run = bool(api_key and source_text.strip())
-
-if not api_key:
-    st.warning("⬆️ API Key를 먼저 입력하세요.")
-elif not source_text.strip():
-    st.warning("⬆️ 시나리오 텍스트를 입력하세요.")
-
-for key in ["stage_1_result", "stage_2_result", "stage_3_result", "stage_4_result", "stage_5_result"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
-
-
-def show_stage_result(stage_num: int, stage_name: str, result_key: str):
-    result = st.session_state.get(result_key)
-    if result:
-        with st.expander(f"📄 Stage {stage_num} 결과 — {stage_name}", expanded=False):
-            st.text(result[:5000] + ("..." if len(result) > 5000 else ""))
-        st.download_button(
-            f"💾 Stage {stage_num} 결과 저장 (TXT)",
-            data=result.encode("utf-8"),
-            file_name=f"stage_{stage_num}_{stage_name.lower().replace(' ', '_')}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key=f"dl_stage_{stage_num}",
+    with col_img_info:
+        st.caption(
+            f"{img_done_cnt}/{total_cnt}컷 완료"
+            + (f" · 남은 {len(pending_imgs)}컷" if pending_imgs else " — 모두 완료")
         )
 
+    # ── 배치 오류 표시 (스레드에서 잡힌 전체 오류) ──────────────────────────
+    if state.get("batch_image_error"):
+        st.error(f"이미지 생성 오류: {state['batch_image_error']}")
 
-def upload_previous_result(stage_num: int, prev_stage_name: str, result_key: str):
-    prev_result = st.session_state.get(result_key)
-    if prev_result:
-        st.success(f"✅ 이전 단계 결과 있음 ({len(prev_result):,}자) — 자동 연결됩니다.")
-        return prev_result
-    else:
-        st.info(f"💡 이전 단계({prev_stage_name}) 결과가 없으면 파일을 업로드하세요.")
-        prev_file = st.file_uploader(
-            f"Stage {stage_num - 1} 결과 파일 업로드",
-            type=["txt"],
-            key=f"prev_upload_{stage_num}",
-        )
-        if prev_file:
-            text = prev_file.read().decode("utf-8", errors="replace")
-            st.success(f"✅ 파일 로드 완료 — {len(text):,}자")
-            return text
-    return None
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 1: Raw Translation
-# ═══════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### ① Raw Translation (Sonnet)")
-st.caption("한국어 → 일본어 직역. 캐릭터명/통화/문화코드 매핑 적용.")
-
-if can_run:
-    if st.button("▶️ Stage 1 실행", key="btn_stage1", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
-
-        system_prompt = build_stage1_prompt(
-            char_map=char_map,
-            style_prompt=selected_style["prompt"],
-            custom_instructions=custom_instructions,
-            loc_map=loc_map,
-        )
-        model_id = MODEL_POLICY["stage_1"]["model"]
-        pages = split_into_pages(source_text)
-
-        progress_bar = st.progress(0)
-        status_area = st.empty()
-
-        results = run_stage_on_pages(
-            client, pages, system_prompt, model_id,
-            "Stage 1: Raw Translation", progress_bar, status_area
-        )
-
-        if results is not None:
-            st.session_state["stage_1_result"] = "\n\n".join(results)
-            status_area.markdown('<div class="progress-text">✅ Stage 1 완료!</div>', unsafe_allow_html=True)
-            st.rerun()
-
-show_stage_result(1, "Raw Translation", "stage_1_result")
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 2: Format Conversion
-# ═══════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### ② Format Conversion (규칙 기반)")
-st.caption("한국 씬 헤더 → 일본 〇柱 포맷. API 호출 없음 (무료).")
-
-stage_2_input = st.session_state.get("stage_1_result")
-if stage_2_input:
-    if st.button("▶️ Stage 2 실행", key="btn_stage2", use_container_width=True):
-        st.session_state["stage_2_result"] = apply_format_conversion(stage_2_input)
-        st.rerun()
-elif st.session_state.get("stage_2_result") is None:
-    st.caption("⏳ Stage 1을 먼저 완료하세요.")
-
-show_stage_result(2, "Format", "stage_2_result")
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 3: Voice Rewrite
-# ═══════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### ③ Voice Rewrite (Opus)")
-st.caption("번역체 제거, 일본 시나리오 문체로 리라이트. JP-1~JP-9 안티패턴 교정.")
-
-stage_3_input = upload_previous_result(3, "Stage 2 Format", "stage_2_result")
-if stage_3_input and api_key:
-    if st.button("▶️ Stage 3 실행", key="btn_stage3", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
-
-        system_prompt = build_stage3_prompt(
-            char_map=char_map,
-            char_tones=char_tones,
-            style_prompt=selected_style["prompt"],
-            custom_instructions=custom_instructions,
-            loc_map=loc_map,
-        )
-        model_id = MODEL_POLICY["stage_3"]["model"]
-        pages = split_into_pages(stage_3_input)
-
-        progress_bar = st.progress(0)
-        status_area = st.empty()
-
-        results = run_stage_on_pages(
-            client, pages, system_prompt, model_id,
-            "Stage 3: Voice Rewrite", progress_bar, status_area
-        )
-
-        if results is not None:
-            st.session_state["stage_3_result"] = "\n\n".join(results)
-            status_area.markdown('<div class="progress-text">✅ Stage 3 완료!</div>', unsafe_allow_html=True)
-            st.rerun()
-elif st.session_state.get("stage_3_result") is None:
-    st.caption("⏳ Stage 2를 먼저 완료하세요.")
-
-show_stage_result(3, "Voice Rewrite", "stage_3_result")
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 4: Dialogue Polish
-# ═══════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### ④ Dialogue Polish (Opus)")
-st.caption("경어 설계 적용, 대사 전문 폴리시. DP-1~DP-6 원칙.")
-
-stage_4_input = upload_previous_result(4, "Stage 3 Voice Rewrite", "stage_3_result")
-if stage_4_input and api_key:
-    if st.button("▶️ Stage 4 실행", key="btn_stage4", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
-
-        system_prompt = build_stage4_prompt(
-            char_map=char_map,
-            char_tones=char_tones,
-            style_prompt=selected_style["prompt"],
-            custom_instructions=custom_instructions,
-            loc_map=loc_map,
-        )
-        model_id = MODEL_POLICY["stage_4"]["model"]
-        pages = split_into_pages(stage_4_input)
-
-        progress_bar = st.progress(0)
-        status_area = st.empty()
-
-        results = run_stage_on_pages(
-            client, pages, system_prompt, model_id,
-            "Stage 4: Dialogue Polish", progress_bar, status_area
-        )
-
-        if results is not None:
-            st.session_state["stage_4_result"] = "\n\n".join(results)
-            status_area.markdown('<div class="progress-text">✅ Stage 4 완료!</div>', unsafe_allow_html=True)
-            st.rerun()
-elif st.session_state.get("stage_4_result") is None:
-    st.caption("⏳ Stage 3를 먼저 완료하세요.")
-
-show_stage_result(4, "Dialogue Polish", "stage_4_result")
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 5: QA Check
-# ═══════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### ⑤ QA Check (Sonnet)")
-st.caption("최종 품질 검증. 포맷/경어/문화코드/스토리 체크리스트.")
-
-stage_5_input = upload_previous_result(5, "Stage 4 Dialogue Polish", "stage_4_result")
-if stage_5_input and api_key:
-    if st.button("▶️ Stage 5 실행", key="btn_stage5", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
-
-        system_prompt = build_stage5_prompt(
-            char_map=char_map,
-            loc_map=loc_map,
-        )
-        model_id = MODEL_POLICY["stage_5"]["model"]
-
-        status_area = st.empty()
-        status_area.markdown(
-            '<div class="progress-text">🔍 QA 검증 중...</div>',
-            unsafe_allow_html=True
-        )
-
+    # ── 상태 새로고침 버튼 ────────────────────────────────────────────────────
+    if st.button("🔄 상태 새로고침", key="img_state_refresh"):
         try:
-            qa_input = stage_5_input
-            if len(qa_input) > 30000:
-                qa_input = stage_5_input[:15000] + "\n\n[...中略...]\n\n" + stage_5_input[-15000:]
-
-            qa_report = call_api(
-                client, qa_input, system_prompt,
-                model_id, max_tokens=4000
-            )
-            st.session_state["stage_5_result"] = qa_report
-            status_area.markdown('<div class="progress-text">✅ Stage 5 완료!</div>', unsafe_allow_html=True)
+            refreshed = manager.load_state(state["project_dir"])
+            st.session_state.current_project = refreshed
             st.rerun()
-        except Exception as e:
-            st.error(f"❌ QA 오류: {e}")
-elif st.session_state.get("stage_5_result") is None:
-    st.caption("⏳ Stage 4를 먼저 완료하세요.")
+        except Exception:
+            st.warning("상태 파일을 불러오지 못했습니다.")
 
-if st.session_state.get("stage_5_result"):
-    st.markdown("**🔍 QA Report**")
-    st.markdown(f'<div class="qa-box">{st.session_state["stage_5_result"]}</div>', unsafe_allow_html=True)
-    st.download_button(
-        "💾 QA Report 저장 (TXT)",
-        data=st.session_state["stage_5_result"].encode("utf-8"),
-        file_name="qa_report_jp.txt",
-        mime="text/plain",
-        use_container_width=True,
-        key="dl_qa",
-    )
+    if img_gen_btn and not st.session_state.gen_running:
+        st.session_state.gen_running = True
+        prog      = st.empty()
+        err_box   = st.empty()
+        done_cnt_local = 0
+        all_ok = True
 
+        for i, scene in enumerate(next_batch):
+            prompt = (scene.get("image_prompt") or scene.get("flow_prompt") or "").strip()
+            if not prompt:
+                continue
+            sno = scene["scene_no"]
+            prog.info(f"🖼 {sno}컷 생성 중… ({i+1}/{len(next_batch)}컷)")
 
-# ═══════════════════════════════════════════════════
-# ★ v1.1 — LOCALIZATION AUDIT (대조표 잔존 검수)
-# ═══════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### 🔎 LOCALIZATION AUDIT — 로컬라이징 검수")
-st.caption("대조표가 실제로 반영됐는지 기계적으로 대조합니다. 한글·카타카나 한국명·원화 잔존을 잡아냅니다.")
+            try:
+                # 소스 결정:
+                #   "모두 FLUX AI"         → 항상 FLUX
+                #   "모두 Unsplash"        → 항상 Unsplash
+                #   "자동 판단" or 키없음  → visual_source / scene_type 기반 분기
+                if not _unsplash_key:
+                    _use_flux = True
+                elif "FLUX" in _img_mode and "모두" in _img_mode:
+                    _use_flux = True
+                elif "Unsplash" in _img_mode and "모두" in _img_mode:
+                    _use_flux = False
+                else:  # 자동 판단
+                    _use_flux = needs_ai_image(scene)
 
-_audit_source = (
-    st.session_state.get("stage_4_result")
-    or st.session_state.get("stage_3_result")
-    or st.session_state.get("stage_2_result")
-    or st.session_state.get("stage_1_result")
-)
+                if _use_flux:
+                    # AI 생성: 씬 타입에 따라 Gemini Imagen 또는 FLUX로 자동 분기
+                    url, _ai_src = smart_ai_image(
+                        scene, api_keys["FAL_KEY"], api_keys.get("GOOGLE_API_KEY", "")
+                    )
+                else:
+                    # Unsplash 라이센스 프리 실사 사진 (산지·카페·분위기)
+                    from src.image_search import search_unsplash, scene_to_query
+                    url = search_unsplash(scene_to_query(scene), _unsplash_key)
+                    _ai_src = "unsplash"
+                # 어느 소스로 생성했는지 기록 (썸네일 캡션·수동 교체 참고용)
+                scene["_img_source"] = _ai_src
 
-if not (char_map or count_loc_entries(loc_map)):
-    st.caption("⏳ 대조표를 먼저 업로드하세요.")
-elif not _audit_source:
-    st.caption("⏳ 번역 결과가 있어야 검수할 수 있습니다.")
-else:
-    col_a, col_b, col_c = st.columns(3)
+                # scene은 state["scenes"] 안의 같은 dict 참조 — 직접 수정
+                scene["image_path"]          = url
+                scene["image_status"]        = "done"
+                scene["reference_image_url"] = url
+                scene.pop("image_error", None)
+                done_cnt_local += 1
 
-    with col_a:
-        if st.button("🔎 검수 실행", key="btn_audit", use_container_width=True):
-            st.session_state["audit_report"] = check_glossary_residue(
-                _audit_source, char_map, loc_map
-            )
+            except Exception as ex:
+                all_ok = False
+                scene["image_status"] = "error"
+                scene["image_error"]  = str(ex)
+                err_box.error(f"#{sno:02d} 수집 실패: {ex}")
 
-    with col_b:
-        if st.button("🈶 한글 잔존 강제 치환", key="btn_ko_fix", use_container_width=True):
-            fixed, log = apply_korean_residue_fix(_audit_source, char_map, loc_map)
-            st.session_state["enforced_result"] = fixed
-            st.session_state["enforce_log"] = log
+            # 씬마다 즉시 저장 — 에러는 화면에 표시
+            try:
+                manager.save_state(state)
+            except Exception as save_ex:
+                err_box.error(f"상태 저장 실패: {save_ex}")
+                all_ok = False
 
-    with col_c:
-        if st.button("🛠 구판 오표기 치환", key="btn_enforce", use_container_width=True):
-            fixed, log = apply_glossary_enforcement(_audit_source, loc_map)
-            st.session_state["enforced_result"] = fixed
-            st.session_state["enforce_log"] = log
+        prog.empty()
+        st.session_state.gen_running = False
 
-    # ── 검수 리포트 ──
-    report = st.session_state.get("audit_report")
-    if report:
-        n_unapplied = len(report["unapplied"])
-        n_residue = sum(cnt for _, _, cnt in report["residue"])
-        n_corr = len(report["corrections_left"])
+        # JSON에서 재로드해 세션 상태 갱신 (저장된 실제 값을 반영)
+        try:
+            refreshed = manager.load_state(state["project_dir"])
+            st.session_state.current_project = refreshed
+        except Exception:
+            st.session_state.current_project = state
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("한국어 원문 잔존", n_unapplied)
-        m2.metric("패턴 잔존 건수", n_residue)
-        m3.metric("오표기 잔존", n_corr)
-
-        if report["unapplied"]:
-            st.error("**대조표 항목이 한국어 그대로 남아 있습니다** — '한글 잔존 강제 치환'으로 정리할 수 있습니다")
-            st.table([
-                {"분류": g, "한국어": ko, "적용되어야 할 일본어": jp}
-                for ko, jp, g in report["unapplied"][:60]
-            ])
-
-        if report["residue"]:
-            st.warning("**한국 고유 요소 패턴이 검출되었습니다**")
-            st.table([
-                {"유형": label, "검출 예": ", ".join(samples), "건수": cnt}
-                for label, samples, cnt in report["residue"]
-            ])
-
-        if report["corrections_left"]:
-            st.warning("**구판 오표기가 남아 있습니다**")
-            st.table([
-                {"오표기": bad, "확정 표기": good, "건수": n}
-                for bad, good, n in report["corrections_left"][:60]
-            ])
-
-        if report["missing"]:
-            with st.expander(f"⚠️ 확정 일본어가 한 번도 등장하지 않은 항목 ({len(report['missing'])}건)", expanded=False):
-                st.caption("원고에 해당 인물·장소가 아예 안 나오는 경우일 수도 있습니다. 참고용입니다.")
-                st.table([
-                    {"분류": g, "한국어": ko, "확정 일본어": jp}
-                    for ko, jp, g in report["missing"][:80]
-                ])
-
-        if not (report["unapplied"] or report["residue"] or report["corrections_left"]):
-            st.success("✅ 검출된 문제가 없습니다. 로컬라이징이 일관되게 적용되었습니다.")
-
-    # ── 강제 치환 결과 ──
-    if st.session_state.get("enforced_result"):
-        log = st.session_state.get("enforce_log") or []
-        if log:
-            st.success(f"✅ {len(log)}종 · 총 {sum(n for _, _, n in log)}건 치환했습니다.")
-            st.table([
-                {"치환 전": bad, "치환 후": good, "건수": n}
-                for bad, good, n in log
-            ])
+        if all_ok:
+            st.success(f"{batch_label} {done_cnt_local}컷 이미지 수집 완료!")
         else:
-            st.info("치환할 항목이 없습니다.")
+            st.warning("일부 컷에서 오류가 발생했습니다. 위 오류 메시지를 확인하세요.")
+        st.rerun()
 
-        st.download_button(
-            "💾 치환본 저장 (TXT)",
-            data=st.session_state["enforced_result"].encode("utf-8"),
-            file_name="localized_enforced_jp.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key="dl_enforced",
-        )
-        if st.button("↪️ 치환본을 최신 결과로 반영", key="btn_apply_enforced", use_container_width=True):
-            for _k in ["stage_4_result", "stage_3_result", "stage_2_result", "stage_1_result"]:
-                if st.session_state.get(_k):
-                    st.session_state[_k] = st.session_state["enforced_result"]
-                    break
-            st.session_state["enforced_result"] = None
-            st.session_state["enforce_log"] = None
-            st.session_state["audit_report"] = None
-            st.rerun()
+    # 씬별 이미지 썸네일 미리보기 (fal CDN URL 또는 로컬 경로 모두 지원)
+    if img_done_cnt > 0:
+        with st.expander(f"생성된 이미지 미리보기 ({img_done_cnt}컷)", expanded=False):
+            thumb_cols = st.columns(4)
+            for i, scene in enumerate(scenes):
+                img_path = scene.get("image_path", "")
+                if not img_path:
+                    continue
+                is_url = img_path.startswith("http")
+                if is_url or os.path.exists(img_path):
+                    with thumb_cols[i % 4]:
+                        st.image(img_path, caption=f"#{scene['scene_no']:02d} {scene.get('name','')}", use_container_width=True)
 
+st.markdown("---")
 
-# ═══════════════════════════════════════════════════
-# FINAL OUTPUT — DOCX
-# ═══════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — 음성 생성 (ElevenLabs) — 스텁
+# ─────────────────────────────────────────────────────────────────────────────
+step3_audio_done   = bool(state.get("audio_path"))
+step3_audio_locked = not step1_done
 
-final_result = (
-    st.session_state.get("stage_4_result")
-    or st.session_state.get("stage_3_result")
-    or st.session_state.get("stage_2_result")
-    or st.session_state.get("stage_1_result")
-)
+st.markdown(f"""
+<div class="step-header">
+  <div class="step-num {"done" if step3_audio_done else ("locked" if step3_audio_locked else "")}">
+    {"✓" if step3_audio_done else "3"}
+  </div>
+  <div>
+    <div class="step-title">STEP 3 · 나레이션 음성 생성 (ElevenLabs)</div>
+    <div class="step-sub">{"음성 파일 준비 완료" if step3_audio_done else ("STEP 1을 먼저 완료하세요." if step3_audio_locked else "전체 나레이션을 ElevenLabs API로 MP3 변환합니다.")}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-if final_result:
-    st.markdown("---")
-    st.markdown('<div class="section-header">📤 FINAL OUTPUT — 최종 다운로드</div>', unsafe_allow_html=True)
-
-    title_slug = st.session_state.get("project_title", "").strip()
-    if title_slug:
-        title_slug = re.sub(r'[^\w\s\-]', '', title_slug).strip()
-        title_slug = re.sub(r'[\s]+', '_', title_slug)
-        base_filename = f"Screenplay_{title_slug}_JP"
+if step3_audio_done:
+    audio_path = state["audio_path"]
+    _audio_is_url = audio_path.startswith("http")
+    if _audio_is_url or os.path.exists(audio_path):
+        st.audio(audio_path, format="audio/mp3")
     else:
-        base_filename = "Screenplay_JP"
+        st.warning("음성 파일이 세션 초기화로 사라졌습니다. 아래 버튼으로 재생성하세요.")
 
-    if st.session_state.get("stage_4_result"):
-        st.caption("✅ Stage 4 (Dialogue Polish) 결과 기준")
-    elif st.session_state.get("stage_3_result"):
-        st.caption("⚠️ Stage 3 (Voice Rewrite) 결과 기준 — Stage 4 미완료")
-    elif st.session_state.get("stage_2_result"):
-        st.caption("⚠️ Stage 2 (Format) 결과 기준 — Stage 3~4 미완료")
+elif not step3_audio_locked:
+    if not api_keys.get("ELEVENLABS_API_KEY"):
+        st.info("ELEVENLABS_API_KEY를 Streamlit Cloud Secrets에 등록하면 이 단계를 실행할 수 있습니다.")
     else:
-        st.caption("⚠️ Stage 1 (Raw Translation) 결과 기준 — 추가 폴리시 권장")
+        narration_text = state.get("full_narration", "").strip()
+        if not narration_text:
+            st.warning("대본에 full_narration 텍스트가 없습니다. STEP 1을 먼저 실행하세요.")
+        else:
+            voice_id = api_keys.get("ELEVENLABS_VOICE_ID", "8jHHF8rMqMlg8if2mOUe")
+            st.caption(f"음성 ID: `{voice_id}` · 모델: `eleven_multilingual_v2`")
+            audio_btn = st.button("🎙 나레이션 음성 생성", key="audio_gen")
+            if audio_btn:
+                with st.spinner("ElevenLabs 음성 생성 중… (약 20~40초)"):
+                    try:
+                        from src.audio import generate_narration_cdn
+                        # fal CDN에 업로드 → URL 저장 (리부트 후에도 유지)
+                        cdn_url = generate_narration_cdn(
+                            api_key=api_keys["ELEVENLABS_API_KEY"],
+                            text=narration_text,
+                            fal_key=api_keys["FAL_KEY"],
+                            voice_id=voice_id,
+                        )
+                        state["audio_path"] = cdn_url
+                        manager.save_state(state)
+                        st.session_state.current_project = state
+                        st.success("음성 생성 완료!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"음성 생성 실패: {e}")
 
-    col1, col2 = st.columns(2)
+st.markdown("---")
 
-    with col1:
-        st.download_button(
-            "📥 TXT 다운로드",
-            data=final_result.encode("utf-8"),
-            file_name=f"{base_filename}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key="dl_final_txt",
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — 컷별 영상 생성 (Fal.ai Kling)
+# ─────────────────────────────────────────────────────────────────────────────
+step3_locked = not step1_done
+
+st.markdown(f"""
+<div class="step-header">
+  <div class="step-num {"done" if done_cnt == total_cnt and total_cnt > 0 else ("locked" if step3_locked else "")}">
+    {"✓" if done_cnt == total_cnt and total_cnt > 0 else "4"}
+  </div>
+  <div>
+    <div class="step-title">STEP 4 · 컷별 영상 생성 (Fal.ai Kling v2.6 Pro)</div>
+    <div class="step-sub">9:16 세로 · 5초 · Flux 이미지 첫 프레임 자동 사용 · 컷별 재생성 가능</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+if step3_locked:
+    st.info("STEP 1 대본 생성 후 이 단계를 진행하세요.")
+elif not api_keys.get("FAL_KEY") and not api_keys.get("REPLICATE_API_TOKEN"):
+    st.warning("FAL_KEY 또는 REPLICATE_API_TOKEN을 Secrets에 등록하면 영상을 생성할 수 있습니다.")
+else:
+    # 영상: 3컷 × 4회 배치 생성
+    VIDEO_BATCH_SIZE  = 3
+    pending_scenes    = [s for s in scenes if s.get("status") in ("pending", "error")]
+    next_vid_batch    = pending_scenes[:VIDEO_BATCH_SIZE]
+    vid_batch_nos     = [s["scene_no"] for s in next_vid_batch]
+    vid_batch_label   = f"{vid_batch_nos[0]}~{vid_batch_nos[-1]}컷" if vid_batch_nos else ""
+
+    col_gen, col_info2 = st.columns([2, 5])
+    with col_gen:
+        all_gen_btn = st.button(
+            f"▶ 다음 {len(next_vid_batch)}컷 생성 ({vid_batch_label})" if next_vid_batch else "✅ 영상 완료",
+            disabled=(len(next_vid_batch) == 0 or st.session_state.gen_running),
         )
-
-    with col2:
-        try:
-            docx_bytes = generate_docx(final_result)
-            st.download_button(
-                "📥 DOCX 다운로드 (横書き A4)",
-                data=docx_bytes,
-                file_name=f"{base_filename}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                key="dl_final_docx",
+    with col_info2:
+        if st.session_state.gen_running:
+            st.info("영상 생성 중…")
+        else:
+            st.caption(
+                f"{done_cnt}/{total_cnt}컷 완료"
+                + (f" · 남은 {len(pending_scenes)}컷" if pending_scenes else " — 모두 완료")
             )
-        except Exception as e:
-            st.error(f"DOCX 생성 오류: {e}")
+
+    # ── 비디오 백엔드 선택: FAL 우선, 없으면 Replicate ─────────────────────────
+    _fal_key        = api_keys.get("FAL_KEY", "")
+    _replicate_key  = api_keys.get("REPLICATE_API_TOKEN", "")
+    _use_replicate  = (not _fal_key) and bool(_replicate_key)
+
+    # 배치 생성 — 병렬 실행 (CDN URL 저장, 리부트 후에도 유지)
+    if all_gen_btn and not st.session_state.gen_running:
+        st.session_state.gen_running = True
+        prog   = st.empty()
+        err_v  = st.empty()
+        all_ok = True
+
+        if _use_replicate:
+            prog.info(f"🎬 {len(next_vid_batch)}컷 병렬 생성 중… (Replicate Wan 2.1 · 약 3~5분)")
+            try:
+                from src.video_replicate import generate_clips_parallel_cdn
+                generate_clips_parallel_cdn(
+                    replicate_token=_replicate_key,
+                    scenes=next_vid_batch,
+                    max_workers=4,
+                )
+                # next_vid_batch는 state["scenes"] 참조 — 이미 수정됨
+                all_ok = all(s.get("status") == "done" for s in next_vid_batch)
+            except Exception as ex:
+                all_ok = False
+                err_v.error(f"Replicate 생성 실패: {ex}")
+        else:
+            prog.info(f"🎬 {len(next_vid_batch)}컷 병렬 생성 중… (Fal.ai Kling · 약 3~5분)")
+            try:
+                from src.video_fal import generate_clips_parallel_cdn
+                generate_clips_parallel_cdn(
+                    fal_key=_fal_key,
+                    scenes=next_vid_batch,
+                    max_workers=4,
+                )
+                all_ok = all(s.get("status") == "done" for s in next_vid_batch)
+            except Exception as ex:
+                all_ok = False
+                err_v.error(f"Fal.ai 생성 실패: {ex}")
+
+        try:
+            manager.save_state(state)
+        except Exception as save_ex:
+            err_v.error(f"상태 저장 실패: {save_ex}")
+            all_ok = False
+
+        prog.empty()
+        st.session_state.gen_running = False
+
+        try:
+            refreshed = manager.load_state(state["project_dir"])
+            st.session_state.current_project = refreshed
+        except Exception:
+            st.session_state.current_project = state
+
+        if all_ok:
+            st.success(f"{vid_batch_label} {len(next_vid_batch)}컷 영상 생성 완료!")
+        else:
+            st.warning("일부 컷에서 오류가 발생했습니다. 씬 카드에서 오류를 확인하세요.")
+        st.rerun()
 
     st.markdown("")
-    if st.button("🗑️ 전체 초기화 (새 프로젝트)", use_container_width=True):
-        for key in ["stage_1_result", "stage_2_result", "stage_3_result",
-                     "stage_4_result", "stage_5_result", "last_error",
-                     "audit_report", "enforced_result", "enforce_log"]:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.rerun()
 
-if "last_error" in st.session_state:
-    st.error(st.session_state["last_error"])
+    # ── 12컷 씬 카드 그리드 ────────────────────────────────────────────────
+    cols_per_row = 3
+    for row_start in range(0, len(scenes), cols_per_row):
+        row_scenes = scenes[row_start : row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
 
+        for col, scene in zip(cols, row_scenes):
+            sno    = scene.get("scene_no", "?")
+            sname  = scene.get("name", "")
+            status = scene.get("status", "pending")
+            narr   = scene.get("narration", "")
+            prompt = scene.get("flow_prompt", "")
+            sfx    = scene.get("sfx", "")
+            overlay= scene.get("overlay_text", "")
+            vid_url= scene.get("video_url", "")
 
-# ── Footer ──
+            with col:
+                st.markdown(f"""
+                <div class="scene-card">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div>
+                      <div class="scene-num">#{sno:02d}</div>
+                      <div class="scene-name">{sname}</div>
+                    </div>
+                    {badge_html(status)}
+                  </div>
+                  <div class="narration-text">{narr}</div>
+                  <div class="meta-chips">
+                    <span class="chip">🔊 {sfx if sfx else '—'}</span>
+                    <span class="chip">📝 {overlay if overlay else '—'}</span>
+                  </div>
+                  <div class="prompt-text">{prompt[:120]}{"…" if len(prompt)>120 else ""}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # ── 레퍼런스 이미지 (Flux 자동생성 우선 / 드라이브 폴백) ──────
+                img_path   = scene.get("image_path", "")
+                img_status = scene.get("image_status", "pending")
+                current_ref = scene.get("reference_image_url", "")
+
+                # 이미지 썸네일 표시 (Unsplash URL 또는 fal CDN URL 또는 로컬 경로 모두 지원)
+                _img_is_url = img_path.startswith("http")
+                if img_path and (_img_is_url or os.path.exists(img_path)):
+                    _src_tag = scene.get("_img_source") or (
+                        "unsplash" if "images.unsplash" in img_path else "flux"
+                    )
+                    _type_tag = scene.get("scene_type", "")
+                    _src_display = {
+                        "unsplash": "📷 Unsplash",
+                        "gpt2":     "🎨 GPT Image 2",
+                        "gemini":   "🎨 Gemini",
+                        "flux":     "🤖 FLUX",
+                    }.get(_src_tag, "🤖 FLUX")
+                    _img_src_caption = _src_display + (f" · {_type_tag}" if _type_tag else "")
+                    st.image(img_path, use_container_width=True,
+                             caption=f"{_img_src_caption} · {img_status}")
+                    new_ref = img_path  # Kling 첫 프레임으로 자동 사용
+
+                    # ── 이미지 교체 옵션 ────────────────────────────────────
+                    if _unsplash_key:
+                        _sw_c1, _sw_c2 = st.columns(2)
+                        with _sw_c1:
+                            _swap_btn = st.button(
+                                "📷 다른 사진", key=f"swap_img_{sno}",
+                                use_container_width=True,
+                                disabled=st.session_state.gen_running,
+                            )
+                        with _sw_c2:
+                            _ai_swap_btn = st.button(
+                                "🤖 AI로 교체", key=f"ai_img_{sno}",
+                                use_container_width=True,
+                                disabled=st.session_state.gen_running,
+                            )
+                    else:
+                        _swap_btn = st.button(
+                            "🖼 다시 생성", key=f"swap_img_{sno}",
+                            use_container_width=True,
+                            disabled=st.session_state.gen_running,
+                        )
+                        _ai_swap_btn = False
+
+                    if _swap_btn:
+                        with st.spinner(f"#{sno:02d} 다른 사진 검색 중…"):
+                            try:
+                                from src.image_search import search_unsplash, scene_to_query
+                                _pg = scene.get("_unsplash_page", 1) + 1
+                                url = search_unsplash(
+                                    scene_to_query(scene), _unsplash_key, page=_pg
+                                )
+                                scene["_unsplash_page"]      = _pg
+                                scene["image_path"]          = url
+                                scene["image_status"]        = "done"
+                                scene["reference_image_url"] = url
+                                scene["_img_source"]         = "unsplash"
+                                scene.pop("image_error", None)
+                                manager.save_state(state)
+                                st.session_state.current_project = state
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"#{sno:02d} 교체 실패: {ex}")
+
+                    if _ai_swap_btn:
+                        with st.spinner(f"#{sno:02d} AI 이미지 생성 중… (약 20~60초)"):
+                            try:
+                                url, _ai_src = smart_ai_image(
+                                    scene, api_keys["FAL_KEY"], api_keys.get("GOOGLE_API_KEY", "")
+                                )
+                                scene["image_path"]          = url
+                                scene["image_status"]        = "done"
+                                scene["reference_image_url"] = url
+                                scene["_img_source"]         = _ai_src
+                                scene.pop("image_error", None)
+                                manager.save_state(state)
+                                st.session_state.current_project = state
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"#{sno:02d} AI 생성 실패: {ex}")
+
+                    # URL 직접 붙여넣기 (Enter 치면 즉시 적용)
+                    _custom_url = st.text_input(
+                        "또는 URL 직접 입력",
+                        value="",
+                        placeholder="https://… 붙여넣고 Enter",
+                        key=f"custom_img_{sno}",
+                        label_visibility="collapsed",
+                    ).strip()
+                    if _custom_url and _custom_url != img_path:
+                        scene["image_path"]          = _custom_url
+                        scene["image_status"]        = "done"
+                        scene["reference_image_url"] = _custom_url
+                        new_ref = _custom_url
+                        manager.save_state(state)
+                        st.session_state.current_project = state
+                        st.rerun()
+
+                else:
+                    # 개별 이미지 생성 버튼
+                    img_status_label = {
+                        "pending": "⏳ 미생성", "generating": "⚙️ 생성중",
+                        "done": "✅ 완료", "error": "❌ 오류"
+                    }.get(img_status, "?")
+                    st.caption(f"이미지: {img_status_label}")
+
+                    _btn_disabled = (img_status == "generating" or st.session_state.gen_running)
+                    if _unsplash_key:
+                        _rc1, _rc2 = st.columns(2)
+                        with _rc1:
+                            _unsplash_single = st.button(
+                                "📷 Unsplash", key=f"img_regen_{sno}",
+                                disabled=_btn_disabled, use_container_width=True,
+                            )
+                        with _rc2:
+                            _flux_single = st.button(
+                                "🤖 FLUX AI", key=f"img_flux_{sno}",
+                                disabled=_btn_disabled, use_container_width=True,
+                            )
+                    else:
+                        _unsplash_single = False
+                        _flux_single = st.button(
+                            f"🖼 #{sno:02d} 이미지 생성", key=f"img_regen_{sno}",
+                            disabled=_btn_disabled, use_container_width=True,
+                        )
+
+                    if _unsplash_single:
+                        with st.spinner(f"#{sno:02d} Unsplash 검색 중…"):
+                            try:
+                                from src.image_search import search_unsplash, scene_to_query
+                                url = search_unsplash(scene_to_query(scene), _unsplash_key)
+                                scene["image_path"]          = url
+                                scene["image_status"]        = "done"
+                                scene["reference_image_url"] = url
+                                scene["_img_source"]         = "unsplash"
+                                scene.pop("image_error", None)
+                                manager.save_state(state)
+                                st.session_state.current_project = state
+                                st.rerun()
+                            except Exception as ex:
+                                scene["image_status"] = "error"
+                                scene["image_error"]  = str(ex)
+                                manager.save_state(state)
+                                st.error(f"#{sno:02d} 오류: {ex}")
+
+                    if _flux_single:
+                        with st.spinner(f"#{sno:02d} AI 이미지 생성 중… (약 20~60초)"):
+                            try:
+                                url, _ai_src = smart_ai_image(
+                                    scene, api_keys["FAL_KEY"], api_keys.get("GOOGLE_API_KEY", "")
+                                )
+                                scene["image_path"]          = url
+                                scene["image_status"]        = "done"
+                                scene["reference_image_url"] = url
+                                scene["_img_source"]         = _ai_src
+                                scene.pop("image_error", None)
+                                manager.save_state(state)
+                                st.session_state.current_project = state
+                                st.rerun()
+                            except Exception as ex:
+                                scene["image_status"] = "error"
+                                scene["image_error"]  = str(ex)
+                                manager.save_state(state)
+                                st.error(f"#{sno:02d} 오류: {ex}")
+
+                    # 드라이브 또는 URL 수동 입력 폴백
+                    gdrive_images = load_gdrive_images(
+                        api_key=api_keys.get("GOOGLE_API_KEY", ""),
+                        folder_id=api_keys.get("GDRIVE_REF_FOLDER_ID", ""),
+                    )
+                    if gdrive_images:
+                        img_options = ["(사용 안 함)"] + [img["name"] for img in gdrive_images]
+                        current_name = next(
+                            (img["name"] for img in gdrive_images if img["url"] == current_ref),
+                            "(사용 안 함)"
+                        )
+                        selected_name = st.selectbox(
+                            "또는 드라이브 이미지",
+                            options=img_options,
+                            index=img_options.index(current_name) if current_name in img_options else 0,
+                            key=f"ref_img_{sno}",
+                        )
+                        new_ref = next(
+                            (img["url"] for img in gdrive_images if img["name"] == selected_name), ""
+                        )
+                    else:
+                        new_ref = st.text_input(
+                            "또는 이미지 URL 직접 입력",
+                            value=current_ref,
+                            placeholder="https://drive.google.com/file/d/.../view",
+                            key=f"ref_img_{sno}",
+                        ).strip()
+
+                # reference_image_url 저장
+                if new_ref != current_ref:
+                    scene["reference_image_url"] = new_ref
+                    manager.save_state(state)
+
+                # 영상 미리보기 (CDN URL 또는 로컬 경로 모두 지원)
+                _vid_is_url = vid_url.startswith("http") if vid_url else False
+                if vid_url and (_vid_is_url or os.path.exists(vid_url)):
+                    st.video(vid_url)
+                elif status == "error":
+                    st.error(scene.get("error_msg", "알 수 없는 오류"))
+
+                # 개별 재생성 버튼 — 동기식 (CDN URL 저장)
+                btn_disabled = (status == "generating" or st.session_state.gen_running)
+                if st.button(
+                    f"🔄 #{sno:02d} 재생성",
+                    key=f"regen_scene_{sno}",
+                    disabled=btn_disabled,
+                    use_container_width=True,
+                ):
+                    with st.spinner(f"#{sno:02d} 재생성 중… (약 2~3분)"):
+                        try:
+                            from src.video_fal import generate_single_clip_url
+                            cdn_url = generate_single_clip_url(
+                                fal_key=api_keys["FAL_KEY"],
+                                prompt=scene.get("flow_prompt", ""),
+                                image_url=scene.get("reference_image_url", ""),
+                            )
+                            for s in state["scenes"]:
+                                if s["scene_no"] == sno:
+                                    s["video_url"] = cdn_url
+                                    s["status"]    = "done"
+                                    s.pop("error_msg", None)
+                                    break
+                            manager.save_state(state)
+                            st.session_state.current_project = state
+                            st.success(f"#{sno:02d} 재생성 완료!")
+                            st.rerun()
+                        except Exception as ex:
+                            for s in state["scenes"]:
+                                if s["scene_no"] == sno:
+                                    s["status"]    = "error"
+                                    s["error_msg"] = str(ex)
+                                    break
+                            manager.save_state(state)
+                            st.error(f"#{sno:02d} 오류: {ex}")
+
+st.markdown("---")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — 최종 합성 (FFmpeg + Whisper) — 스텁
+# ─────────────────────────────────────────────────────────────────────────────
+step4_done   = bool(state.get("final_video_path"))
+step4_locked = done_cnt < total_cnt or total_cnt == 0 or not state.get("audio_path")
+
 st.markdown(f"""
-<div class="footer">
-    BLUE JEANS PICTURES — Japanese-Translator v{VERSION} ({ENGINE_BUILD_DATE})<br>
-    5-Stage Market Adaptation Pipeline · Powered by Anthropic Claude API
+<div class="step-header">
+  <div class="step-num {"done" if step4_done else ("locked" if step4_locked else "")}">
+    {"✓" if step4_done else "5"}
+  </div>
+  <div>
+    <div class="step-title">STEP 5 · 최종 합성 (FFmpeg + Whisper 자막)</div>
+    <div class="step-sub">
+      {"최종 영상 완성!" if step4_done
+        else ("STEP 2 음성 + STEP 3 전체 영상 완료 후 실행 가능" if step4_locked
+              else "음성·영상·SFX·BGM을 합쳐 다이나믹 자막 포함 숏폼을 생성합니다.")}
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+if step4_done:
+    final_path = state["final_video_path"]
+    _final_is_url = final_path.startswith("http") if final_path else False
+    if _final_is_url or os.path.exists(final_path):
+        st.video(final_path)
+        if _final_is_url:
+            st.markdown(f"[⬇️ 최종 영상 다운로드]({final_path})")
+        else:
+            with open(final_path, "rb") as fv:
+                st.download_button(
+                    label="⬇️ 최종 영상 다운로드",
+                    data=fv,
+                    file_name=f"{state.get('project_id','final')}.mp4",
+                    mime="video/mp4",
+                )
+    else:
+        st.caption(f"파일 경로: `{final_path}`")
+elif not step4_locked:
+    st.info("영상 클립과 나레이션 음성이 준비되면 아래 버튼으로 최종 영상을 합성합니다.")
+    if st.button("🎬 최종 합성 실행", key="assemble_btn"):
+        with st.spinner("FFmpeg로 합성 중… 클립 다운로드 포함 약 2~5분 소요됩니다."):
+            try:
+                from src.assembler import assemble_final_video
+                cdn_url = assemble_final_video(state, api_keys["FAL_KEY"])
+                state["final_video_path"] = cdn_url
+                state["status"] = "done"
+                manager.save_state(state)
+                st.session_state.current_project = state
+                st.success("최종 합성 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"합성 실패: {e}")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 자동 새로고침 — 백그라운드 생성 중일 때 10초마다 화면 갱신
+# ─────────────────────────────────────────────────────────────────────────────
+if any_generating:
+    # force_refresh는 한 번만 — 다음 사이클부터는 실제 generating 상태로 판단
+    st.session_state.force_refresh = False
+    # 상태 파일에서 최신 데이터 다시 로드
+    try:
+        refreshed = manager.load_state(state["project_dir"])
+        st.session_state.current_project = refreshed
+    except Exception:
+        pass
+    time.sleep(8)
+    st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 푸터
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="factory-footer">
+  너도나도아는커피 숏폼 팩토리 · Powered by Claude API · ElevenLabs · Fal.ai Kling
 </div>
 """, unsafe_allow_html=True)
