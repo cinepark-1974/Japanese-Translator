@@ -15,6 +15,12 @@ Keigo Tags: keigo / teinei / tameguchi / kenson / ibar
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v1.1.1 (2026-09-17)
+  - 버그 수정: MODEL_POLICY 모델 ID 갱신 (404 not_found_error 해결)
+    claude-sonnet-4-20250514 → claude-sonnet-5
+    claude-opus-4-20250514   → claude-opus-5
+    구 모델은 2026-06-15 자로 API에서 폐기됨.
+
 v1.1 (2026-09-17)
   - 기능 추가: 로컬라이징 대조표(XLSX) 통합
     인물표 CSV/TXT 외에 다중 시트 엑셀 대조표를 읽어
@@ -41,7 +47,7 @@ v1.0
 # ENGINE VERSION (세만틱 버저닝)
 # ═══════════════════════════════════════════════════
 
-ENGINE_VERSION = "1.1"
+ENGINE_VERSION = "1.1.1"
 ENGINE_BUILD_DATE = "2026-09-17"
 
 
@@ -876,25 +882,30 @@ def _build_tone_section(char_tones: dict) -> str:
 # MODEL POLICY
 # ═══════════════════════════════════════════════════
 
+# ※ 모델 ID 표기 규칙 (4.6 세대 이후)
+#   claude-{name}-{major}[-{minor}]  예) claude-sonnet-5 / claude-opus-5
+#   구 세대는 날짜 포함형        예) claude-haiku-4-5-20251001
+#   claude-sonnet-4-20250514 / claude-opus-4-20250514 은 2026-06-15 자로 폐기됨.
+
 MODEL_POLICY = {
     "stage_1": {
         "name": "Raw Translation",
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-sonnet-5",
         "reason": "정확한 번역 — 속도+품질 균형",
     },
     "stage_3": {
         "name": "Voice Rewrite",
-        "model": "claude-opus-4-20250514",
+        "model": "claude-opus-5",
         "reason": "네이티브 문체 리라이팅 — 최고 품질 필수",
     },
     "stage_4": {
         "name": "Dialogue Polish",
-        "model": "claude-opus-4-20250514",
+        "model": "claude-opus-5",
         "reason": "경어 설계 + 대사 현지화 — 문화적 뉘앙스 필수",
     },
     "stage_5": {
         "name": "QA Check",
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-sonnet-5",
         "reason": "체크리스트 기반 검증 — Sonnet으로 충분",
     },
 }
