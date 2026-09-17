@@ -13,6 +13,11 @@ Pipeline:
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v1.1.1 (2026-09-17)
+  - 버그 수정: 폐기된 모델 ID로 인한 Stage 실행 404 오류 해결
+    (prompt.py MODEL_POLICY 갱신 — claude-sonnet-5 / claude-opus-5)
+  - 사이드바·파이프라인 안내에 실제 사용 모델 ID 표기
+
 v1.1 (2026-09-17)
   - 로컬라이징 대조표(XLSX) 업로드 지원
     · 다중 시트 자동 인식 (주요 인물 / 조·단역 / 지명·기관 / 법조문)
@@ -1049,11 +1054,11 @@ custom_instructions = st.text_area(
 # ── Pipeline Info ──
 st.markdown(
     '<div class="pipeline-info"><strong>5-Stage Market Adaptation Pipeline:</strong><br>'
-    'Stage 1: Raw Translation → Sonnet (직역 + 캐릭터/통화/문화 매핑)<br>'
+    f'Stage 1: Raw Translation → <code>{MODEL_POLICY["stage_1"]["model"]}</code> (직역 + 캐릭터/통화/문화 매핑)<br>'
     'Stage 2: Format Conversion → 규칙 기반 (무료, 〇柱 포맷 변환)<br>'
-    'Stage 3: Voice Rewrite → Opus (번역체 제거, 일본 시나리오 문체)<br>'
-    'Stage 4: Dialogue Polish → Opus (경어 설계, 대사 현지화)<br>'
-    'Stage 5: QA Check → Sonnet (포맷/경어/문화코드/스토리 검증)<br>'
+    f'Stage 3: Voice Rewrite → <code>{MODEL_POLICY["stage_3"]["model"]}</code> (번역체 제거, 일본 시나리오 문체)<br>'
+    f'Stage 4: Dialogue Polish → <code>{MODEL_POLICY["stage_4"]["model"]}</code> (경어 설계, 대사 현지화)<br>'
+    f'Stage 5: QA Check → <code>{MODEL_POLICY["stage_5"]["model"]}</code> (포맷/경어/문화코드/스토리 검증)<br>'
     '<br>💡 각 단계별로 독립 실행 · 결과 저장 · 이어서 진행 가능<br>'
     '🔎 대조표를 올리면 Stage 1·3·4에 매핑이 강제 주입되고, 하단 LOCALIZATION AUDIT에서 잔존 검수가 가능합니다.</div>',
     unsafe_allow_html=True
