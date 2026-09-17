@@ -13,6 +13,63 @@ Pipeline:
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v2.0 (2026-09-18)
+  - 메이저: 「번역 엔진 결함 분석 의견서」 반영 (원문 41% 분량 절단 사고)
+  - [D-1] 씬 단위 배치 루프로 전환 — 글자 수 분할 폐기
+    · split_into_scene_batches() / detect_scene_pattern() 신설
+      한국 원고의 씬 헤딩 패턴 5종 자동 판별 (INT./EXT. · S#번호 · 씬번호 · 번호+장소 · 〇)
+    · 씬 경계로만 자르므로 씬이 중간에 끊기지 않음
+    · 배치당 씬 수를 UI에서 조절 (기본 4씬)
+    · estimate_output_tokens() — 배치 입력 길이 × 3으로 max_tokens 동적 산정
+      (구버전은 입력 8,000자에 max_tokens 8,000 고정 → 출력 잘림의 직접 원인)
+    · call_api_ex() — stop_reason 반환. 'max_tokens' 면 절단으로 즉시 경고
+    · 배치 간 문맥 전달 (직전 결과 꼬리 250자) — 표기·문체 연속성
+    · 배치별 입력/출력 씬 수 대조 리포트
+  - [D-2] 고정 용어집 MD를 매 호출 시스템 프롬프트에 강제 주입
+    · 고정 용어집 JSON 파서 신설 (characters/minor/places/law/money)
+    · 대화 이력이 아닌 시스템 프롬프트라 배치가 몇 개든 표기가 흔들리지 않음
+  - [D-3] DOCX 출력부
+    · w:eastAsia 폰트 지정 — 한자·가나가 Yu Gothic으로 렌더링되지 않던 문제
+      (한 줄 안에서 숫자·영문만 고딕으로 튀던 현상)
+    · normalize_screenplay_text() — 〇 뒤 공백 제거, 話者名 뒤 공백 제거,
+      동작 지문을 カギ括弧 안쪽으로 이동 (V.O./声のみ 계열은 바깥 유지)
+  - [D-4] VALIDATION GATE 신설 — 출고 전 원본 대비 자동 대조
+    · 씬 수 (오차 0) / 본문 글자 수 (85% 이상) / 대사 줄 수 (±5%) / 금지 표기 (0건)
+    · run_validation_gate() / count_dialogue_lines_ko() / count_dialogue_lines_ja()
+      / find_forbidden_cue_usage()
+    · 실패 시 화면 상단에 경고 배너
+  - [버그] Stage 2 숫자 파손 수정 (치명)
+    구버전 정규식은 씬 표지 부분이 선택항목이라 숫자로 시작하는 모든 줄을 파괴했다.
+      "1,000,000 BTC" → "〇,000,000 BTC" / "2026年3月" → "〇年3月"
+    → 씬 표지(INT./EXT./실내/실외)가 실제로 뒤따를 때만 치환하도록 변경
+
+v1.3 (2026-09-18)
+  - 실제 출력물(「상속」 일본어판 DOCX) 분석 결과 반영 — DOCX 렌더러 전면 개선
+  - [수정] 連続セリフ 오분류: 人物名 없는 「」 단독 행 29건이 ト書き(3字下げ)로
+    들어가던 문제 → SerifuCont 스타일 신설, 앞 대사 본문과 좌측 정렬
+  - [수정] 지문 오분류: 「」가 포함된 지문 17건이 セリフ로 잡히던 문제
+    → 人物名 후보에 문장부호 불가 + 행 끝이 」일 것 + 길이 12자 이내로 판정 강화
+  - [수정] 転換 과잉 분류: 「インサート。…」「字幕——…」 14건이 転換으로 가던 문제
+    → Insert 스타일 신설, 단독 전환어만 Tenkan
+  - [추가] 표지 페이지 자동 생성 — 첫 柱 앞 블록(제목·캐치프레이즈·작가·저작권번호)
+    을 분리 조판 후 페이지 나누기
+  - [추가] 푸터 페이지 번호 (표지 제외)
+  - [추가] セリフ 매달림 들여쓰기 — 긴 대사 2행 이후가 人物名 폭만큼 정렬
+  - [추가] 柱 씬 번호 옵션 (기본 OFF)
+  - [추가] 📐 DOCX 출력 옵션 UI (표지/페이지번호/씬번호/제작사명)
+  - [추가] unify_dialogue_cues() — 대사 헤드 姓/名 혼용 기계 통일
+    + AUDIT에 '🎭 대사 헤드 통일' 버튼
+  - parse_translation_workbook() 반환값에 char_cues 추가 (5-tuple)
+  - 세션 백업에 saved_char_cues 포함
+
+v1.2 (2026-09-17)
+  - 프로젝트 세션 백업 (JSON 중간 저장/불러오기) 추가
+    · 원고 · Stage 1~5 결과 · 붙여넣기 페이지 본문 저장
+    · 로컬라이징 대조표 매핑(인물/조단역/지명/법조문)까지 함께 저장
+      → 복원하면 대조표를 다시 올리지 않아도 검수·치환이 그대로 동작
+    · 파일명에 제목 · 진행도(n/5) · 저장 시각 자동 기록
+    · 신설: export_session_backup() / import_session_backup() / make_backup_filename()
+
 v1.1.1 (2026-09-17)
   - 버그 수정: 폐기된 모델 ID로 인한 Stage 실행 404 오류 해결
     (prompt.py MODEL_POLICY 갱신 — claude-sonnet-5 / claude-opus-5)
@@ -48,6 +105,7 @@ from datetime import datetime
 from prompt import (
     ENGINE_VERSION,
     ENGINE_BUILD_DATE,
+    NO_COMPRESSION_RULE,
     STYLE_PRESETS,
     KEIGO_TONE_TAGS,
     MODEL_POLICY,
@@ -179,8 +237,15 @@ div[data-testid="stFileUploader"] { background-color: #fff !important; border-ra
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-MAX_CHARS_PER_PAGE = 8000
-VERSION = ENGINE_VERSION  # prompt.py 단일 출처 — 버전 표기 일원화
+MAX_CHARS_PER_PAGE = 8000          # 씬 헤딩을 못 찾았을 때만 쓰는 예비 분할 기준
+VERSION = ENGINE_VERSION           # prompt.py 단일 출처 — 버전 표기 일원화
+
+# ★ v2.0 — 씬 단위 배치 기본값
+DEFAULT_SCENES_PER_BATCH = 4       # 한 번의 API 호출에 넣는 씬 수
+BATCH_CONTEXT_CHARS = 250          # 직전 배치 결과에서 넘겨줄 꼬리 문맥 길이
+MIN_OUTPUT_TOKENS = 8000           # 배치당 출력 토큰 하한
+MAX_OUTPUT_TOKENS = 64000          # 배치당 출력 토큰 상한
+OUTPUT_TOKEN_RATIO = 3.0           # 입력 1자당 확보할 출력 토큰 (일본어 안전 계수)
 
 
 # ═══════════════════════════════════════════════════
@@ -199,7 +264,10 @@ _BACKUP_KEYS = [
     "stage_1_result", "stage_2_result", "stage_3_result",
     "stage_4_result", "stage_5_result",
     # 로컬라이징 매핑 (대조표 재업로드 없이 복구)
-    "saved_char_map", "saved_char_tones", "saved_loc_map", "saved_char_yomi",
+    "saved_char_map", "saved_char_tones", "saved_loc_map",
+    "saved_char_yomi", "saved_char_cues", "saved_glossary_text",
+    # 배치 실행 리포트
+    "batch_report_1", "batch_report_3", "batch_report_4",
 ]
 
 _STAGE_KEYS = [
@@ -397,7 +465,7 @@ def _is_safe_correction(bad: str, good: str) -> bool:
 def parse_translation_workbook(uploaded_file):
     """XLSX 로컬라이징 대조표를 파싱한다. (v1.1)
 
-    반환: (char_map, char_tones, loc_map, char_yomi)
+    반환: (char_map, char_tones, loc_map, char_yomi, char_cues)
       char_map  : {한국명: 일본명}            — 주요 등장인물 (+약칭 → 대사 헤드)
       char_tones: {일본명: keigo tag}          — 경어 태그 열이 있을 때
       loc_map   : {
@@ -407,6 +475,7 @@ def parse_translation_workbook(uploaded_file):
             "corrections": {구판 오표기 일본어: 확정 일본어},
         }
       char_yomi : {일본명: 요미가나}           — UI 표시용
+      char_cues : {일본명: 대사 헤드}          — 대사 헤드 통일용 (v1.3)
 
     시트명·헤더명을 키워드로 자동 인식한다.
     일본어 열이 없는 시트(영문 전용)는 건너뛴다.
@@ -420,7 +489,7 @@ def parse_translation_workbook(uploaded_file):
     uploaded_file.seek(0)
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
 
-    char_map, char_tones, char_yomi = {}, {}, {}
+    char_map, char_tones, char_yomi, char_cues = {}, {}, {}, {}
     loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
 
     # ── 사전 스캔: 어느 시트에 있든 '한국명 → 약칭'을 모아둔다 ──
@@ -510,6 +579,8 @@ def parse_translation_workbook(uploaded_file):
                 # 약칭(석훈) → 대사 헤드(神崎) 도 매핑에 포함한다.
                 # 원고 본문·대사 헤드에는 약칭이 훨씬 자주 등장한다.
                 cue = _clean_term(row[cue_i], strip_kr_note=True) if (cue_i >= 0 and len(row) > cue_i) else ""
+                if cue:
+                    char_cues[jp] = cue
                 short = _clean_term(row[short_i]) if (short_i >= 0 and len(row) > short_i) else ""
                 if not short:
                     short = short_index.get(ko, "")
@@ -530,7 +601,76 @@ def parse_translation_workbook(uploaded_file):
                     if _is_safe_correction(variant, jp):
                         loc_map["corrections"][variant] = jp
 
-    return char_map, char_tones, loc_map, char_yomi
+    return char_map, char_tones, loc_map, char_yomi, char_cues
+
+
+def build_cue_unify_map(char_cues: dict) -> dict:
+    """대사 헤드 통일용 매핑을 만든다. (v1.3)
+
+    번역 결과는 같은 인물을 성(神崎)과 이름(遼)으로 번갈아 쓰는 경우가 많다.
+    대조표의 '일본명(풀네임)'과 '대사 헤드'를 대조해, 헤드가 아닌 표기를
+    헤드로 모아준다.  예) 神崎 遼 / 대사 헤드 神崎  →  遼 → 神崎
+
+    반환: {대체될 표기: 확정 대사 헤드}
+    """
+    unify = {}
+    if not char_cues:
+        return unify
+
+    for full_name, cue in char_cues.items():
+        cue = str(cue).strip()
+        if not cue:
+            continue
+        # 풀네임을 성/이름으로 분해 (공백·중점 구분)
+        parts = [p for p in re.split(r"[\s　・]+", str(full_name).strip()) if p]
+        candidates = list(parts)
+        joined = "".join(parts)
+        if joined and joined not in candidates:
+            candidates.append(joined)       # 공백 없는 표기 (神崎遼)
+
+        # ★ v2.0 — 용어집 JSON처럼 풀네임에 공백이 없는 경우
+        #   헤드가 앞/뒤에 붙어 있으면 나머지가 이름 표기다. (神崎遼 − 神崎 → 遼)
+        if joined.startswith(cue) and len(joined) > len(cue):
+            candidates.append(joined[len(cue):])
+        if joined.endswith(cue) and len(joined) > len(cue):
+            candidates.append(joined[:-len(cue)])
+
+        for part in candidates:
+            if part and part != cue and len(part) >= 1 and part not in unify:
+                unify[part] = cue
+    return unify
+
+
+def unify_dialogue_cues(text: str, char_cues: dict) -> tuple:
+    """대사 헤드(행 첫머리 인물명)를 대조표의 확정 표기로 통일한다. (v1.3)
+
+    행 첫머리 + 「 또는 （부기）「 직전 위치만 치환하므로,
+    지문 속의 같은 이름은 건드리지 않는다.
+
+    반환: (치환된 텍스트, [(치환 전, 치환 후, 횟수), ...])
+    """
+    if not text:
+        return text, []
+
+    unify = build_cue_unify_map(char_cues)
+    if not unify:
+        return text, []
+
+    log = []
+    for old in sorted(unify.keys(), key=len, reverse=True):
+        new = unify[old]
+        # 話者名과 「 사이에 공백이 끼어 있어도 잡는다 (정규화 전후 어느 쪽이든 동작)
+        pattern = re.compile(
+            r"^(?P<indent>[ \t　]*)" + re.escape(old)
+            + r"(?P<paren>(?:（[^）]{0,20}）|\([^)]{0,20}\)){0,2})[ \t　]*(?=「)",
+            re.MULTILINE,
+        )
+        found = len(pattern.findall(text))
+        if found:
+            text = pattern.sub(lambda m: f"{m.group('indent')}{new}{m.group('paren')}", text)
+            log.append((old, new, found))
+
+    return text, log
 
 
 def count_loc_entries(loc_map: dict) -> int:
@@ -721,7 +861,7 @@ def parse_character_map(uploaded_file) -> tuple:
 
     # ★ v1.1 — XLSX 로컬라이징 대조표는 전용 파서로 넘긴다
     if name.endswith((".xlsx", ".xlsm")):
-        cm, ct, _lm, _yomi = parse_translation_workbook(uploaded_file)
+        cm, ct, _lm, _yomi, _cues = parse_translation_workbook(uploaded_file)
         return cm, ct
 
     content = uploaded_file.read().decode("utf-8", errors="replace")
@@ -836,6 +976,346 @@ def split_into_pages(text: str, max_chars: int = MAX_CHARS_PER_PAGE) -> list:
     return pages
 
 
+# ═══════════════════════════════════════════════════
+# ★ v2.0 — 씬 단위 배치 분할
+# 문자 수가 아니라 씬 경계로 나눈다. 씬이 잘리지 않으므로
+# 모델이 "남은 분량을 밀어 넣으려고" 압축할 여지가 없어진다.
+# ═══════════════════════════════════════════════════
+
+_SOURCE_SCENE_PATTERNS = [
+    ("INT./EXT.", r'^[ \t]*(?:S\s*#?\s*\d+[\.\)]?\s*)?(?:INT|EXT|I\s*/\s*E)\s*[\./]'),
+    ("S#번호",    r'^[ \t]*S\s*#\s*\d+'),
+    ("씬 번호",   r'^[ \t]*씬\s*\d+'),
+    ("번호+장소", r'^[ \t]*\d+[\.\)]\s*(?:실내|실외|INT|EXT)'),
+    ("〇 (일본식)", r'^[ \t]*〇'),
+]
+
+
+def detect_scene_pattern(text: str) -> tuple:
+    """원고에서 씬 헤딩 패턴을 자동 판별한다. (v2.0)
+
+    반환: (라벨, 정규식, 검출 수). 못 찾으면 (None, None, 0).
+    """
+    best = (None, None, 0)
+    for label, pat in _SOURCE_SCENE_PATTERNS:
+        n = len(re.findall(pat, text or "", re.MULTILINE | re.IGNORECASE))
+        if n > best[2]:
+            best = (label, pat, n)
+    return best if best[2] >= 2 else (None, None, best[2])
+
+
+def count_scenes(text: str, pattern: str = None) -> int:
+    """씬 헤딩 개수를 센다."""
+    if not text:
+        return 0
+    if pattern:
+        return len(re.findall(pattern, text, re.MULTILINE | re.IGNORECASE))
+    return detect_scene_pattern(text)[2]
+
+
+def split_into_scene_batches(text: str, scenes_per_batch: int = DEFAULT_SCENES_PER_BATCH,
+                             pattern: str = None) -> tuple:
+    """원고를 씬 경계로 잘라 N씬씩 묶는다. (v2.0)
+
+    반환: (배치 리스트, 사용한 패턴 라벨, 총 씬 수)
+    씬 헤딩을 못 찾으면 기존 문자 수 분할로 폴백한다.
+    """
+    if not text:
+        return [], None, 0
+
+    if pattern:
+        label, pat = "(지정)", pattern
+        total = count_scenes(text, pat)
+    else:
+        label, pat, total = detect_scene_pattern(text)
+
+    if not pat or total < 2:
+        return split_into_pages(text), None, total
+
+    starts = [m.start() for m in re.finditer(pat, text, re.MULTILINE | re.IGNORECASE)]
+
+    # 첫 씬 앞의 도입부(표지·제목 등)는 첫 배치에 붙인다
+    segments = []
+    head = text[:starts[0]].strip()
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(text)
+        segments.append(text[s:e].rstrip())
+
+    batches = []
+    step = max(1, int(scenes_per_batch))
+    for i in range(0, len(segments), step):
+        chunk = "\n\n".join(segments[i:i + step])
+        if i == 0 and head:
+            chunk = head + "\n\n" + chunk
+        batches.append(chunk)
+
+    return batches, label, total
+
+
+def estimate_output_tokens(batch_text: str) -> int:
+    """배치 입력 길이에 맞춰 출력 토큰 한도를 잡는다. (v2.0)
+
+    한국어 → 일본어는 문자 수가 크게 줄지 않는다. 안전 계수 3배를 곱해
+    출력이 한도에 걸려 잘리는 사고를 막는다.
+    """
+    need = int(len(batch_text or "") * OUTPUT_TOKEN_RATIO)
+    return max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS, need))
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.0 — 고정 용어집 (JSON / MD)
+# ═══════════════════════════════════════════════════
+
+def read_text_upload(uploaded_file) -> str:
+    """업로드된 텍스트 파일(MD/TXT)을 문자열로 읽는다."""
+    data = uploaded_file.read()
+    uploaded_file.seek(0)
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
+
+
+def parse_glossary_json(uploaded_file):
+    """고정 용어집 JSON을 파싱한다. (v2.0)
+
+    기대 구조:
+      {
+        "characters": [{ko, ko_short, ja, yomi, cue}, ...],
+        "minor":      [{ko, ja}, ...],
+        "places":     [{ko, ja}, ...],
+        "law":        [{ko, ja}, ...],
+        "money":      [{ko, ja}, ...]
+      }
+
+    반환: (char_map, char_tones, loc_map, char_yomi, char_cues, raw_dict)
+    """
+    raw = read_text_upload(uploaded_file)
+    data = json.loads(raw)
+
+    char_map, char_tones, char_yomi, char_cues = {}, {}, {}, {}
+    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
+
+    for c in data.get("characters") or []:
+        ko = str(c.get("ko") or "").strip()
+        ja = str(c.get("ja") or "").strip()
+        cue = str(c.get("cue") or "").strip()
+        short = str(c.get("ko_short") or "").strip()
+        yomi = str(c.get("yomi") or "").strip()
+        if not ko or not ja:
+            continue
+        char_map[ko] = ja
+        if cue:
+            char_cues[ja] = cue
+        if yomi:
+            char_yomi[ja] = yomi
+        if short and short not in char_map:
+            char_map[short] = cue or ja
+        tone = str(c.get("tone") or "").strip().lower()
+        if tone in KEIGO_TONE_TAGS:
+            char_tones[ja] = tone
+
+    def _fill(key, bucket):
+        for item in data.get(key) or []:
+            ko = str(item.get("ko") or "").strip()
+            ja = str(item.get("ja") or "").strip()
+            # 값에 한글이 있으면 매핑이 아니라 설명문이므로 제외 (예: 환산 기준)
+            if ko and ja and not _has_hangul(ja):
+                loc_map[bucket][ko] = ja
+
+    _fill("minor", "extras")
+    _fill("places", "places")
+    _fill("money", "places")
+    _fill("law", "legal")
+
+    return char_map, char_tones, loc_map, char_yomi, char_cues, data
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.0 — 검증 게이트 (원본 대비 분량·표기 대조)
+# ═══════════════════════════════════════════════════
+
+def count_dialogue_lines_ko(text: str) -> tuple:
+    """한국어 원고의 대사 줄 수를 추정한다. (v2.0)
+
+    시나리오 서식이 작품마다 달라 두 가지 패턴을 모두 시도하고
+    더 많이 잡히는 쪽을 채택한다. 반환: (건수, 사용한 패턴 라벨)
+    """
+    if not text:
+        return 0, None
+    lines = [ln.rstrip() for ln in text.split("\n")]
+
+    # 패턴 A — 인물명 한 줄 + 다음 줄에 대사 (미국식 배치)
+    cue_only = re.compile(r'^[ \t]*([가-힣A-Za-z][^\s:：。.!?,]{0,11})(\s*\([^)]{0,12}\))?[ \t]*$')
+    a = 0
+    for i, ln in enumerate(lines[:-1]):
+        if cue_only.match(ln) and lines[i + 1].strip() and not cue_only.match(lines[i + 1]):
+            if not re.match(r'^[ \t]*(?:INT|EXT|S\s*#|씬|\d+[\.\)])', ln, re.IGNORECASE):
+                a += 1
+
+    # 패턴 B — 인물명: 대사 (한 줄 배치)
+    b = len(re.findall(r'^[ \t]*[가-힣A-Za-z][^\s:：]{0,11}\s*[:：]\s*\S', text, re.MULTILINE))
+
+    if a >= b and a > 0:
+        return a, "인물명 줄 + 대사 줄"
+    if b > 0:
+        return b, "인물명: 대사"
+    return 0, None
+
+
+def count_dialogue_lines_ja(text: str) -> int:
+    """일본어 원고의 대사 줄 수를 센다 (연속 대사 포함)."""
+    if not text:
+        return 0
+    n = 0
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if not s or not s.endswith('」'):
+            continue
+        if _DOC_CUE_RE.match(s) or _DOC_CONT_SERIFU_RE.match(s):
+            n += 1
+    return n
+
+
+def find_forbidden_cue_usage(text: str, char_cues: dict) -> list:
+    """대사 헤드로 쓰이면 안 되는 표기(이름 표기)를 검출한다. (v2.0)
+
+    반환: [(표기, 확정 헤드, 건수), ...]
+    """
+    out = []
+    for old, new in build_cue_unify_map(char_cues).items():
+        pattern = re.compile(
+            r"^[ \t　]*" + re.escape(old)
+            + r"(?:（[^）]{0,20}）|\([^)]{0,20}\)){0,2}[ \t　]*(?=「)",
+            re.MULTILINE,
+        )
+        n = len(pattern.findall(text or ""))
+        if n:
+            out.append((old, new, n))
+    return sorted(out, key=lambda x: -x[2])
+
+
+def run_validation_gate(source_text: str, target_text: str,
+                        char_cues: dict = None,
+                        scene_tolerance: int = 0,
+                        char_ratio_floor: float = 0.85,
+                        dialogue_tolerance: float = 0.05) -> dict:
+    """번역 결과를 원본과 대조해 분량 소실·표기 위반을 검출한다. (v2.0)
+
+    반환: {"rows": [...], "passed": bool, "forbidden": [...]}
+    각 row: {항목, 원본, 번역, 차이, 판정}
+    """
+    rows = []
+    forbidden = []
+
+    src = source_text or ""
+    tgt = target_text or ""
+
+    # ── 씬 수 ──
+    s_label, s_pat, s_scenes = detect_scene_pattern(src)
+    t_scenes = len(re.findall(r'^[ \t]*〇', tgt, re.MULTILINE))
+    scene_ok = (s_scenes == 0) or (abs(s_scenes - t_scenes) <= scene_tolerance)
+    rows.append({
+        "항목": f"씬 수 ({s_label or '패턴 미검출'})",
+        "원본": s_scenes, "번역": t_scenes,
+        "차이": t_scenes - s_scenes,
+        "판정": "OK" if scene_ok else "실패",
+    })
+
+    # ── 본문 글자 수 ──
+    def _body_chars(t):
+        return sum(len(ln.strip()) for ln in t.split("\n") if ln.strip())
+    s_chars, t_chars = _body_chars(src), _body_chars(tgt)
+    ratio = (t_chars / s_chars) if s_chars else 0
+    chars_ok = ratio >= char_ratio_floor if s_chars else True
+    rows.append({
+        "항목": "본문 글자 수",
+        "원본": f"{s_chars:,}", "번역": f"{t_chars:,}",
+        "차이": f"{ratio*100:.0f}%" if s_chars else "—",
+        "판정": "OK" if chars_ok else "실패",
+    })
+
+    # ── 대사 줄 수 ──
+    s_dlg, d_label = count_dialogue_lines_ko(src)
+    t_dlg = count_dialogue_lines_ja(tgt)
+    if s_dlg:
+        diff = abs(t_dlg - s_dlg) / s_dlg
+        dlg_ok = diff <= dialogue_tolerance
+        diff_txt = f"{(t_dlg - s_dlg) / s_dlg * 100:+.1f}%"
+    else:
+        dlg_ok, diff_txt = True, "—"
+    rows.append({
+        "항목": f"대사 줄 수 ({d_label or '추정 불가'})",
+        "원본": s_dlg or "—", "번역": t_dlg,
+        "차이": diff_txt,
+        "판정": "OK" if dlg_ok else "경고",
+    })
+
+    # ── 금지 표기 (이름 표기가 대사 헤드로 쓰였는가) ──
+    if char_cues:
+        forbidden = find_forbidden_cue_usage(tgt, char_cues)
+        rows.append({
+            "항목": "금지 표기 (이름 표기)",
+            "원본": "—",
+            "번역": sum(n for _, _, n in forbidden),
+            "차이": f"{len(forbidden)}종",
+            "판정": "OK" if not forbidden else "실패",
+        })
+
+    passed = all(r["판정"] == "OK" for r in rows)
+    return {"rows": rows, "passed": passed, "forbidden": forbidden}
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.0 — 출력 정규화 (DOCX 쓰기 직전 후처리)
+# ═══════════════════════════════════════════════════
+
+# V.O. 계열은 카ギ括弧 바깥에 그대로 둔다
+_OUTSIDE_PAREN_KEYS = (
+    "V.O.", "VO", "声のみ", "OFF", "O.S.", "OS", "電話", "続き", "ナレーション",
+)
+
+
+def normalize_screenplay_text(text: str) -> tuple:
+    """모델 출력을 서식 규격에 맞게 정규화한다. (v2.0)
+
+    ① 柱의 〇 뒤 공백 제거
+    ② 話者名 뒤 공백 제거
+    ③ 동작 지문을 カギ括弧 안쪽으로 이동 (V.O. 계열은 바깥 유지)
+
+    반환: (정규화된 텍스트, {항목: 건수})
+    """
+    if not text:
+        return text, {}
+
+    stats = {"柱 공백 제거": 0, "話者名 공백 제거": 0, "동작 지문 이동": 0}
+    out = []
+
+    for ln in text.split("\n"):
+        s = ln.rstrip()
+
+        # ① 〇 뒤 공백
+        m = re.match(r'^([ \t　]*)〇[ \t　]+(\S.*)$', s)
+        if m:
+            s = f"{m.group(1)}〇{m.group(2)}"
+            stats["柱 공백 제거"] += 1
+
+        # ② 話者名 뒤 공백  (神崎 「…」 → 神崎「…」)
+        m = re.match(r'^([ \t　]*)([^「」。、\s　]{1,12})((?:（[^）]{0,20}）){0,2})[ \t　]+「(.*)$', s)
+        if m:
+            s = f"{m.group(1)}{m.group(2)}{m.group(3)}「{m.group(4)}"
+            stats["話者名 공백 제거"] += 1
+
+        # ③ 동작 지문을 「」 안쪽으로
+        m = re.match(r'^([ \t　]*)([^「」。、\s　]{1,12})（([^）]{1,24})）「(.*)$', s)
+        if m and not any(k in m.group(3) for k in _OUTSIDE_PAREN_KEYS):
+            s = f"{m.group(1)}{m.group(2)}「（{m.group(3)}）{m.group(4)}"
+            stats["동작 지문 이동"] += 1
+
+        out.append(s)
+
+    return "\n".join(out), {k: v for k, v in stats.items() if v}
+
+
 # ─────────────────────────────────────────────
 # STAGE 2: FORMAT CONVERSION (Rule-based)
 # ─────────────────────────────────────────────
@@ -845,10 +1325,30 @@ def apply_format_conversion(text: str) -> str:
     result = text
 
     # ── Scene heading: number prefix → 〇 ──
-    # Patterns: "1. INT. ..." / "1. EXT. ..." / "S#1. INT. ..." / "씬1. ..."
+    # ★ v2.0 버그 수정 —
+    #   구버전 패턴은 숫자 접두어 뒤의 INT./EXT. 부분이 선택항목이라,
+    #   "1,000,000 BTC" / "3,700万円" / "2026年3月" 처럼 숫자로 시작하는
+    #   모든 줄의 첫 숫자를 〇로 바꿔버렸다. (금액·연도 파손)
+    #   → 씬 표지(INT./EXT./실내/실외)가 실제로 뒤따를 때만 치환한다.
+    SCENE_MARKER = r'(?:INT\.?\s*/?\s*EXT\.?|EXT\.?\s*/?\s*INT\.?|INT\.?|EXT\.?|I/E\.?|실내|실외)'
+
+    # 1) 번호 + 씬 표지  →  〇
     result = re.sub(
-        r'^(?:\d+\.?\s*|S\s*#?\s*\d+\.?\s*|씬\s*\d+\.?\s*)'
-        r'(?:INT\.\s*/??\s*EXT\.\s*|EXT\.\s*/??\s*INT\.\s*|INT\.\s*|EXT\.\s*)?',
+        r'^(?:\d+[\.\)]\s*|S\s*#?\s*\d+[\.\)]?\s*|씬\s*\d+[\.\)]?\s*)' + SCENE_MARKER + r'[\.\s]*',
+        '〇',
+        result,
+        flags=re.MULTILINE | re.IGNORECASE
+    )
+    # 2) 씬 표지 단독  →  〇
+    result = re.sub(
+        r'^' + SCENE_MARKER + r'[\.\s]+',
+        '〇',
+        result,
+        flags=re.MULTILINE | re.IGNORECASE
+    )
+    # 3) 번호 접두어만 남은 씬 헤더(S#12. / 씬12.) → 〇
+    result = re.sub(
+        r'^(?:S\s*#?\s*\d+[\.\)]?\s*|씬\s*\d+[\.\)]?\s*)(?=\S)',
         '〇',
         result,
         flags=re.MULTILINE | re.IGNORECASE
@@ -908,14 +1408,19 @@ def apply_format_conversion(text: str) -> str:
 # API CALL FUNCTION
 # ─────────────────────────────────────────────
 
-def call_api(client, text: str, system_prompt: str, model_id: str,
-             max_tokens: int = 8000, page_info: str = "") -> str:
-    """Call Claude API with streaming to prevent timeout."""
+def call_api_ex(client, text: str, system_prompt: str, model_id: str,
+                max_tokens: int = 8000, page_info: str = "") -> tuple:
+    """Call Claude API with streaming. (v2.0 — stop_reason까지 반환)
+
+    반환: (출력 텍스트, stop_reason)
+    stop_reason 이 'max_tokens' 이면 출력이 한도에서 잘린 것이다.
+    """
     full_system = system_prompt
     if page_info:
         full_system += f"\n\n[Internal context: {page_info}. Do NOT include this in output.]"
 
     collected = []
+    stop_reason = None
     with client.messages.stream(
         model=model_id,
         max_tokens=max_tokens,
@@ -924,43 +1429,111 @@ def call_api(client, text: str, system_prompt: str, model_id: str,
     ) as stream:
         for text_chunk in stream.text_stream:
             collected.append(text_chunk)
+        try:
+            final = stream.get_final_message()
+            stop_reason = getattr(final, "stop_reason", None)
+        except Exception:
+            stop_reason = None
 
-    return "".join(collected)
+    return "".join(collected), stop_reason
+
+
+def call_api(client, text: str, system_prompt: str, model_id: str,
+             max_tokens: int = 8000, page_info: str = "") -> str:
+    """Call Claude API with streaming to prevent timeout."""
+    out, _ = call_api_ex(client, text, system_prompt, model_id, max_tokens, page_info)
+    return out
+
+
+def run_stage_on_batches(client, batches: list, system_prompt: str,
+                         model_id: str, stage_name: str,
+                         progress_bar, status_area,
+                         scene_pattern: str = None,
+                         carry_context: bool = True) -> tuple:
+    """씬 단위 배치로 스테이지를 실행한다. (v2.0)
+
+    - 배치마다 입력 길이에 맞춰 max_tokens 를 산정한다 (출력 잘림 방지)
+    - stop_reason 이 max_tokens 면 절단으로 기록한다
+    - 직전 배치 결과의 꼬리를 문맥으로 넘겨 표기·문체가 이어지게 한다
+    - 배치별 입력/출력 씬 수를 대조해 누락을 즉시 잡는다
+
+    반환: (결과 리스트, 배치 리포트 리스트) — 실패 시 (None, 리포트)
+    """
+    results = []
+    report = []
+    total = len(batches)
+    prev_tail = ""
+
+    for idx, batch in enumerate(batches):
+        n = idx + 1
+        max_tok = estimate_output_tokens(batch)
+
+        status_area.markdown(
+            f'<div class="progress-text">🔄 {stage_name} — 배치 {n}/{total} 처리 중… '
+            f'(입력 {len(batch):,}자 · 출력 한도 {max_tok:,} 토큰 · {model_id})</div>',
+            unsafe_allow_html=True
+        )
+
+        ctx = f"Batch {n} of {total}. Translate this batch COMPLETELY. Do not summarize or merge scenes."
+        if carry_context and prev_tail:
+            ctx += (
+                "\n\n[Tail of the previous batch's output — for continuity of naming, "
+                "keigo level and tone ONLY. Do NOT repeat or re-translate it.]\n"
+                + prev_tail
+            )
+
+        try:
+            out, stop_reason = call_api_ex(
+                client, batch, system_prompt, model_id,
+                max_tokens=max_tok, page_info=ctx
+            )
+        except anthropic.APIError as e:
+            msg = f"❌ API 오류 ({stage_name}, 배치 {n}): {e}"
+            st.error(msg)
+            st.session_state["last_error"] = msg
+            return None, report
+        except Exception as e:
+            msg = f"❌ 오류 ({stage_name}, 배치 {n}): {type(e).__name__}: {e}"
+            st.error(msg)
+            st.session_state["last_error"] = msg
+            return None, report
+
+        in_scenes = count_scenes(batch, scene_pattern) if scene_pattern else count_scenes(batch)
+        out_scenes = len(re.findall(r'^[ \t]*〇', out, re.MULTILINE))
+        truncated = (stop_reason == "max_tokens")
+
+        report.append({
+            "배치": n,
+            "입력 자수": len(batch),
+            "출력 자수": len(out),
+            "입력 씬": in_scenes,
+            "출력 씬": out_scenes,
+            "출력 한도": max_tok,
+            "절단": "⚠️ 예" if truncated else "아니오",
+            "stop_reason": stop_reason or "-",
+        })
+
+        if truncated:
+            st.error(
+                f"⚠️ 배치 {n} 출력이 토큰 한도({max_tok:,})에서 잘렸습니다. "
+                "배치 씬 수를 줄이고 다시 실행하세요."
+            )
+
+        results.append(out)
+        prev_tail = out[-BATCH_CONTEXT_CHARS:] if out else ""
+        progress_bar.progress(n / total)
+
+    return results, report
 
 
 def run_stage_on_pages(client, pages: list, system_prompt: str,
                        model_id: str, stage_name: str,
                        progress_bar, status_area) -> list:
-    """Run an API-based stage on multiple pages with progress tracking."""
-    results = []
-    total = len(pages)
-
-    for idx, page in enumerate(pages):
-        page_num = idx + 1
-        status_area.markdown(
-            f'<div class="progress-text">🔄 {stage_name} — 페이지 {page_num}/{total} 처리 중... (모델: {model_id})</div>',
-            unsafe_allow_html=True
-        )
-
-        try:
-            result = call_api(
-                client, page, system_prompt, model_id,
-                page_info=f"Page {page_num} of {total}. Maintain consistency."
-            )
-            results.append(result)
-        except anthropic.APIError as e:
-            error_msg = f"❌ API 오류 ({stage_name}, 페이지 {page_num}): {e}"
-            st.error(error_msg)
-            st.session_state["last_error"] = error_msg
-            return None
-        except Exception as e:
-            error_msg = f"❌ 오류 ({stage_name}, 페이지 {page_num}): {type(e).__name__}: {e}"
-            st.error(error_msg)
-            st.session_state["last_error"] = error_msg
-            return None
-
-        progress_bar.progress(page_num / total)
-
+    """(구버전 호환) 문자 수 분할 실행. v2.0부터는 씬 배치 실행을 쓴다."""
+    results, _ = run_stage_on_batches(
+        client, pages, system_prompt, model_id, stage_name,
+        progress_bar, status_area, carry_context=True
+    )
     return results
 
 
@@ -968,11 +1541,188 @@ def run_stage_on_pages(client, pages: list, system_prompt: str,
 # DOCX GENERATION (横書き A4)
 # ─────────────────────────────────────────────
 
-def generate_docx(text: str) -> bytes:
-    """Generate formatted Japanese screenplay DOCX (横書き A4)."""
+# ═══════════════════════════════════════════════════
+# ★ v1.3 — 라인 분류 규칙 (DOCX 렌더러)
+# ═══════════════════════════════════════════════════
+
+# 柱
+_DOC_HASHIRA_RE = re.compile(r'^〇')
+
+# 단독 전환어 (뒤에 내용이 붙지 않는 것만)
+_DOC_TRANSITION_SOLO_RE = re.compile(
+    r'^(カットバック|カット|フェイドイン|フェイドアウト|スマッシュカット|'
+    r'ディゾルブ|オーバーラップ|暗転|明転|回想|回想明け|現在|モンタージュ)'
+    r'[。．]?$'
+)
+
+# タイトル・字幕 카드 (내용이 붙는 경우 포함)
+_DOC_TITLECARD_RE = re.compile(r'^(タイトル|サブタイトル|字幕)[。．\s—–ー「]')
+
+# インサート・화면 표시 — 지문 계열로 처리
+_DOC_INSERT_RE = re.compile(r'^(インサート|【|［|\[|画面[—–ー]{1,2}|＜画面)')
+
+# 대사: 인물명 + (부기) + 「  …  」로 끝나야 함
+# 인물명에는 문장부호가 들어가지 않는다 → 지문 속 인용문과 구분된다
+_DOC_CUE_RE = re.compile(
+    r'^(?P<cue>[^「」。．、，,！？!?…—–ー・：:；;【】［］\[\]（）()〇\s　]{1,12})'
+    r'(?P<paren>(?:（[^）]{0,20}）|\([^)]{0,20}\)){0,2})\s*「'
+)
+
+# 인물명 없이 「」만 있는 줄 → 직전 대사의 이어지는 대사
+_DOC_CONT_SERIFU_RE = re.compile(r'^「.*」$')
+
+
+def _classify_line(s: str, prev_kind: str = "") -> str:
+    """한 줄을 시나리오 요소로 분류한다. (v1.3)
+
+    prev_kind — 직전 줄의 분류. 인물명 없는 「」 단독 행을
+    '이어지는 대사'로 볼지 '화면 표시(인서트)'로 볼지 판정하는 데 쓴다.
+
+    반환: hashira / tenkan / insert / serifu / serifu_cont / togaki
+    """
+    if _DOC_HASHIRA_RE.match(s):
+        return 'hashira'
+    if _DOC_TRANSITION_SOLO_RE.match(s):
+        return 'tenkan'
+    if _DOC_TITLECARD_RE.match(s):
+        return 'tenkan'
+    if _DOC_INSERT_RE.match(s):
+        return 'insert'
+    if '「' in s and s.endswith('」'):
+        if _DOC_CUE_RE.match(s):
+            return 'serifu'
+        if _DOC_CONT_SERIFU_RE.match(s):
+            # 직전이 대사면 같은 인물이 이어 말하는 것,
+            # 직전이 지문이면 화면·서류·메모에 적힌 문구로 본다.
+            return 'serifu_cont' if prev_kind in ('serifu', 'serifu_cont') else 'insert'
+    return 'togaki'
+
+
+def _add_page_number_footer(section):
+    """푸터 중앙에 페이지 번호 필드를 넣는다."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    footer = section.footer
+    para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    para.text = ""
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = para.add_run()
+    run.font.name = 'Yu Gothic'
+    run.font.size = __import__('docx').shared.Pt(9)
+
+    fld_begin = OxmlElement('w:fldChar')
+    fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = 'PAGE'
+    fld_end = OxmlElement('w:fldChar')
+    fld_end.set(qn('w:fldCharType'), 'end')
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_end)
+
+
+def _build_cover_page(doc, cover_lines: list, studio_name: str = ""):
+    """본문 앞 블록을 표지 페이지로 조판한다. (v1.3)"""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    def _p(text, size, bold=False, space_before=0, space_after=0, color=None):
+        para = doc.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para.paragraph_format.space_before = Pt(space_before)
+        para.paragraph_format.space_after = Pt(space_after)
+        para.paragraph_format.line_spacing = 1.4
+        run = para.add_run(text)
+        run.font.name = 'Yu Gothic'
+        try:
+            from docx.oxml.ns import qn as _qn
+            _rf = run._element.get_or_add_rPr().get_or_add_rFonts()
+            for _k in ('w:ascii', 'w:hAnsi', 'w:eastAsia', 'w:cs'):
+                _rf.set(_qn(_k), 'Yu Gothic')
+        except Exception:
+            pass
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        if color:
+            run.font.color.rgb = color
+        return para
+
+    copyright_line = ""
+    title = ""
+    tagline = ""
+    author = ""
+    kind = ""
+    leftovers = []
+
+    for ln in cover_lines:
+        if re.search(r'(著作権|登録番号|C-\d{4}-\d+)', ln):
+            copyright_line = ln
+        elif re.match(r'^[＜<《【\[].+[＞>》】\]]$', ln):
+            title = re.sub(r'^[＜<《【\[]|[＞>》】\]]$', '', ln).strip()
+        elif re.match(r'^(シナリオ|脚本|原作|作|脚色)\s*[｜|│:：]', ln):
+            author = ln
+        elif re.fullmatch(r'(シナリオ|脚本|企画書|トリートメント)', ln):
+            kind = ln
+        elif ln.startswith('「') and ln.endswith('」'):
+            tagline = ln
+        else:
+            leftovers.append(ln)
+
+    # 제목을 못 찾으면 가장 짧은 줄을 제목으로 삼는다
+    if not title and leftovers:
+        cand = min(leftovers, key=len)
+        if len(cand) <= 20:
+            title = cand
+            leftovers.remove(cand)
+
+    _p("", 10, space_before=90)
+    if kind:
+        _p(kind, 11, space_after=6)
+    if tagline:
+        _p(tagline, 10.5, space_after=30)
+    if title:
+        _p(title, 30, bold=True, space_before=24, space_after=24)
+    for ln in leftovers:
+        _p(ln, 10.5, space_after=4)
+    if author:
+        _p(author, 12, space_before=36)
+    if copyright_line:
+        _p(copyright_line, 9, space_before=60)
+    if studio_name:
+        _p(studio_name, 10, space_before=18)
+
+    doc.add_page_break()
+
+
+def generate_docx(text: str, make_cover: bool = True, page_numbers: bool = True,
+                  scene_numbers: bool = False, studio_name: str = "") -> bytes:
+    """Generate formatted Japanese screenplay DOCX (横書き A4). (v1.3 개선)
+
+    make_cover    : 본문 앞 블록을 표지 페이지로 분리
+    page_numbers  : 푸터 페이지 번호 (표지 제외)
+    scene_numbers : 柱에 씬 번호 부여 (〇1　場所（時間）)
+    studio_name   : 표지 하단 제작사 표기
+    """
     from docx import Document
     from docx.shared import Pt, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+
+    def _set_ja_font(style, name='Yu Gothic'):
+        """★ v2.0 — w:eastAsia 지정. 없으면 한자·가나가 다른 서체로 떨어진다."""
+        style.font.name = name
+        try:
+            rpr = style.element.get_or_add_rPr()
+            rfonts = rpr.get_or_add_rFonts()
+            rfonts.set(qn('w:ascii'), name)
+            rfonts.set(qn('w:hAnsi'), name)
+            rfonts.set(qn('w:eastAsia'), name)
+            rfonts.set(qn('w:cs'), name)
+        except Exception:
+            pass
 
     doc = Document()
 
@@ -985,9 +1735,17 @@ def generate_docx(text: str) -> bytes:
     section.top_margin = Cm(2.0)
     section.bottom_margin = Cm(2.0)
 
+    # 표지에는 페이지 번호를 넣지 않는다
+    if page_numbers:
+        try:
+            section.different_first_page_header_footer = bool(make_cover)
+            _add_page_number_footer(section)
+        except Exception:
+            pass
+
     # ── Styles ──
     style_normal = doc.styles['Normal']
-    style_normal.font.name = 'Yu Gothic'
+    _set_ja_font(style_normal)
     style_normal.font.size = Pt(10.5)
     style_normal.paragraph_format.space_after = Pt(0)
     style_normal.paragraph_format.space_before = Pt(0)
@@ -995,7 +1753,7 @@ def generate_docx(text: str) -> bytes:
 
     # Scene heading (柱)
     style_scene = doc.styles.add_style('Hashira', 1)
-    style_scene.font.name = 'Yu Gothic'
+    _set_ja_font(style_scene)
     style_scene.font.size = Pt(10.5)
     style_scene.font.bold = True
     style_scene.paragraph_format.space_before = Pt(24)
@@ -1004,7 +1762,7 @@ def generate_docx(text: str) -> bytes:
 
     # Action (ト書き) — 3字下げ
     style_action = doc.styles.add_style('Togaki', 1)
-    style_action.font.name = 'Yu Gothic'
+    _set_ja_font(style_action)
     style_action.font.size = Pt(10.5)
     style_action.paragraph_format.left_indent = Cm(1.0)  # ~3字下げ
     style_action.paragraph_format.space_before = Pt(3)
@@ -1013,71 +1771,82 @@ def generate_docx(text: str) -> bytes:
 
     # Character name (人物名)
     style_char = doc.styles.add_style('Jinmei', 1)
-    style_char.font.name = 'Yu Gothic'
+    _set_ja_font(style_char)
     style_char.font.size = Pt(10.5)
     style_char.font.bold = True
     style_char.paragraph_format.space_before = Pt(6)
     style_char.paragraph_format.space_after = Pt(0)
     style_char.paragraph_format.line_spacing = 1.5
 
-    # Dialogue (セリフ)
+    # Dialogue (セリフ) — 人物名 + 「」. 2행 이후는 인물명 폭만큼 매달림 들여쓰기
     style_dialog = doc.styles.add_style('Serifu', 1)
-    style_dialog.font.name = 'Yu Gothic'
+    _set_ja_font(style_dialog)
     style_dialog.font.size = Pt(10.5)
-    style_dialog.paragraph_format.space_before = Pt(0)
+    style_dialog.paragraph_format.left_indent = Cm(1.6)
+    style_dialog.paragraph_format.first_line_indent = Cm(-1.6)
+    style_dialog.paragraph_format.space_before = Pt(4)
     style_dialog.paragraph_format.space_after = Pt(0)
     style_dialog.paragraph_format.line_spacing = 1.5
 
+    # 이어지는 セリフ (인물명 없이 「」만 있는 줄) — 앞 대사 본문과 좌측 정렬
+    style_dialog_cont = doc.styles.add_style('SerifuCont', 1)
+    _set_ja_font(style_dialog_cont)
+    style_dialog_cont.font.size = Pt(10.5)
+    style_dialog_cont.paragraph_format.left_indent = Cm(1.6)
+    style_dialog_cont.paragraph_format.first_line_indent = Cm(0)
+    style_dialog_cont.paragraph_format.space_before = Pt(0)
+    style_dialog_cont.paragraph_format.space_after = Pt(0)
+    style_dialog_cont.paragraph_format.line_spacing = 1.5
+
+    # インサート・画面表示 — ト書き 계열이되 앞뒤 여백으로 구분
+    style_insert = doc.styles.add_style('Insert', 1)
+    _set_ja_font(style_insert)
+    style_insert.font.size = Pt(10.5)
+    style_insert.paragraph_format.left_indent = Cm(1.0)
+    style_insert.paragraph_format.space_before = Pt(8)
+    style_insert.paragraph_format.space_after = Pt(4)
+    style_insert.paragraph_format.line_spacing = 1.5
+
     # Transition
     style_trans = doc.styles.add_style('Tenkan', 1)
-    style_trans.font.name = 'Yu Gothic'
+    _set_ja_font(style_trans)
     style_trans.font.size = Pt(10.5)
-    style_trans.paragraph_format.space_before = Pt(6)
-    style_trans.paragraph_format.space_after = Pt(6)
+    style_trans.font.bold = True
+    style_trans.paragraph_format.space_before = Pt(12)
+    style_trans.paragraph_format.space_after = Pt(12)
     style_trans.paragraph_format.line_spacing = 1.5
 
     # ── Parse and format ──
-    HASHIRA_RE = re.compile(r'^〇')
-    TRANSITION_RE = re.compile(
-        r'^(カットバック|インサート|フェイドイン|フェイドアウト|スマッシュカット|タイトル|字幕|モンタージュ)',
-    )
-    # セリフ: name「...」 or name（声のみ）「...」
-    SERIFU_RE = re.compile(r'^(.+?)(?:（[^）]*）)?\s*「')
+    lines = [ln.strip() for ln in text.split('\n')]
+    lines = [ln for ln in lines if ln]
 
-    lines = text.split('\n')
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
+    # 첫 柱 앞의 블록은 표지 후보 (저작권 번호·제목·작가명 등)
+    first_hashira = next((i for i, ln in enumerate(lines) if _DOC_HASHIRA_RE.match(ln)), -1)
+    body_start = 0
+    if make_cover and 0 < first_hashira <= 12:
+        _build_cover_page(doc, lines[:first_hashira], studio_name=studio_name)
+        body_start = first_hashira
 
-        if not stripped:
-            i += 1
-            continue
+    _STYLE_OF = {
+        'hashira': 'Hashira',
+        'tenkan': 'Tenkan',
+        'insert': 'Insert',
+        'serifu': 'Serifu',
+        'serifu_cont': 'SerifuCont',
+        'togaki': 'Togaki',
+    }
 
-        # 柱
-        if HASHIRA_RE.match(stripped):
-            doc.add_paragraph(stripped, style='Hashira')
-            i += 1
-            continue
+    scene_no = 0
+    prev_kind = ""
+    for ln in lines[body_start:]:
+        kind = _classify_line(ln, prev_kind)
+        prev_kind = kind
 
-        # 転換
-        if TRANSITION_RE.match(stripped):
-            doc.add_paragraph(stripped, style='Tenkan')
-            i += 1
-            continue
+        if kind == 'hashira' and scene_numbers:
+            scene_no += 1
+            ln = re.sub(r'^〇\s*', f'〇{scene_no}　', ln)
 
-        # セリフ (「」を含む行)
-        if '「' in stripped:
-            # 人物名 + セリフ が同一行
-            m = SERIFU_RE.match(stripped)
-            if m:
-                doc.add_paragraph(stripped, style='Serifu')
-                i += 1
-                continue
-
-        # ト書き (default)
-        doc.add_paragraph(stripped, style='Togaki')
-        i += 1
+        doc.add_paragraph(ln, style=_STYLE_OF[kind])
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1136,6 +1905,25 @@ custom_instructions = st.text_area(
     placeholder="예: 특정 용어는 이렇게 번역해줘 / 경어 레벨을 이렇게 조정해줘...",
 )
 
+# ── ★ v2.0 — 씬 단위 배치 설정 ──
+sb1, sb2 = st.columns([1, 2])
+with sb1:
+    scenes_per_batch = st.number_input(
+        "🎬 배치당 씬 수",
+        min_value=1, max_value=12, value=DEFAULT_SCENES_PER_BATCH, step=1,
+        help="한 번의 API 호출에 넣는 씬 수. 적을수록 누락 위험이 낮고 호출 수가 늘어납니다.",
+    )
+with sb2:
+    carry_context = st.checkbox(
+        "직전 배치 문맥 이어주기 (표기·문체 일관성)",
+        value=True,
+        help="직전 배치 결과의 마지막 250자를 다음 호출에 참고용으로 전달합니다.",
+    )
+    st.caption(
+        "⚠️ v2.0부터 원고를 **글자 수가 아니라 씬 경계**로 나눠 호출합니다. "
+        "씬이 중간에 잘리지 않으므로 분량 소실이 발생하지 않습니다."
+    )
+
 # ── Pipeline Info ──
 st.markdown(
     '<div class="pipeline-info"><strong>5-Stage Market Adaptation Pipeline:</strong><br>'
@@ -1164,21 +1952,48 @@ st.info(
 
 char_map_file = st.file_uploader(
     "대조표 파일 업로드",
-    type=["xlsx", "xlsm", "csv", "txt"],
-    help="XLSX: 다중 시트 대조표 (권장) | CSV: 한국이름,일본이름,경어태그 | TXT: 한국이름 → 일본이름",
+    type=["json", "xlsx", "xlsm", "csv", "txt"],
+    help="JSON: 고정 용어집 (권장) | XLSX: 다중 시트 대조표 | CSV/TXT: 인물표",
     key="char_map_upload"
 )
+
+# ★ v2.0 — 고정 용어집 MD (매 호출 시스템 프롬프트에 통째로 주입)
+glossary_md_file = st.file_uploader(
+    "📌 고정 용어집 MD (선택 · 매 호출 강제 주입)",
+    type=["md", "txt"],
+    help="glossary_작품명_ja.md — 표기가 호출마다 흔들리는 것을 막습니다.",
+    key="glossary_md_upload",
+)
+glossary_text = ""
+if glossary_md_file:
+    try:
+        glossary_text = read_text_upload(glossary_md_file)
+        st.session_state["saved_glossary_text"] = glossary_text
+        st.success(f"✅ 고정 용어집 로드 — {len(glossary_text):,}자 · 매 호출 시스템 프롬프트에 주입됩니다.")
+        with st.expander("📖 주입될 용어집 내용", expanded=False):
+            st.markdown(glossary_text)
+    except Exception as e:
+        st.error(f"❌ 용어집을 읽지 못했습니다: {e}")
+if not glossary_text:
+    glossary_text = st.session_state.get("saved_glossary_text", "") or ""
+    if glossary_text:
+        st.caption(f"↩️ 이전 고정 용어집 사용 중 — {len(glossary_text):,}자")
 
 char_map = {}
 char_tones = {}
 char_yomi = {}
+char_cues = {}
 loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
 
 if char_map_file:
     fname = char_map_file.name.lower()
     try:
-        if fname.endswith((".xlsx", ".xlsm")):
-            char_map, char_tones, loc_map, char_yomi = parse_translation_workbook(char_map_file)
+        if fname.endswith(".json"):
+            (char_map, char_tones, loc_map,
+             char_yomi, char_cues, _raw) = parse_glossary_json(char_map_file)
+        elif fname.endswith((".xlsx", ".xlsm")):
+            (char_map, char_tones, loc_map,
+             char_yomi, char_cues) = parse_translation_workbook(char_map_file)
         else:
             char_map, char_tones = parse_character_map(char_map_file)
     except Exception as e:
@@ -1191,6 +2006,7 @@ if char_map_file:
         st.session_state["saved_char_tones"] = char_tones
         st.session_state["saved_loc_map"] = loc_map
         st.session_state["saved_char_yomi"] = char_yomi
+        st.session_state["saved_char_cues"] = char_cues
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("주요 인물", f"{len(char_map)}")
@@ -1261,6 +2077,7 @@ if not char_map and st.session_state.get("saved_char_map"):
     char_tones = st.session_state.get("saved_char_tones") or {}
     loc_map = st.session_state.get("saved_loc_map") or loc_map
     char_yomi = st.session_state.get("saved_char_yomi") or {}
+    char_cues = st.session_state.get("saved_char_cues") or {}
     st.caption(
         f"↩️ 이전 매핑 사용 중 — 인물 {len(char_map)}건 · 기타 {count_loc_entries(loc_map)}건"
     )
@@ -1534,17 +2351,26 @@ if can_run:
             style_prompt=selected_style["prompt"],
             custom_instructions=custom_instructions,
             loc_map=loc_map,
+            glossary_text=glossary_text,
         )
         model_id = MODEL_POLICY["stage_1"]["model"]
-        pages = split_into_pages(source_text)
+        batches, pat_label, n_scenes = split_into_scene_batches(source_text, scenes_per_batch)
+        _, scene_pat, _ = detect_scene_pattern(source_text)
+
+        st.info(
+            f"🎬 씬 패턴 `{pat_label or '미검출 — 글자 수 분할로 진행'}` · "
+            f"총 {n_scenes}씬 → {len(batches)}배치"
+        )
 
         progress_bar = st.progress(0)
         status_area = st.empty()
 
-        results = run_stage_on_pages(
-            client, pages, system_prompt, model_id,
-            "Stage 1: Raw Translation", progress_bar, status_area
+        results, batch_report = run_stage_on_batches(
+            client, batches, system_prompt, model_id,
+            "Stage 1: Raw Translation", progress_bar, status_area,
+            scene_pattern=scene_pat, carry_context=carry_context,
         )
+        st.session_state["batch_report_1"] = batch_report
 
         if results is not None:
             st.session_state["stage_1_result"] = "\n\n".join(results)
@@ -1590,17 +2416,22 @@ if stage_3_input and api_key:
             style_prompt=selected_style["prompt"],
             custom_instructions=custom_instructions,
             loc_map=loc_map,
+            glossary_text=glossary_text,
         )
         model_id = MODEL_POLICY["stage_3"]["model"]
-        pages = split_into_pages(stage_3_input)
+        batches, pat_label, n_scenes = split_into_scene_batches(
+            stage_3_input, scenes_per_batch, pattern=r'^[ \t]*〇')
+        st.info(f"🎬 〇柱 기준 {n_scenes}씬 → {len(batches)}배치")
 
         progress_bar = st.progress(0)
         status_area = st.empty()
 
-        results = run_stage_on_pages(
-            client, pages, system_prompt, model_id,
-            "Stage 3: Voice Rewrite", progress_bar, status_area
+        results, batch_report = run_stage_on_batches(
+            client, batches, system_prompt, model_id,
+            "Stage 3: Voice Rewrite", progress_bar, status_area,
+            scene_pattern=r'^[ \t]*〇', carry_context=carry_context,
         )
+        st.session_state["batch_report_3"] = batch_report
 
         if results is not None:
             st.session_state["stage_3_result"] = "\n\n".join(results)
@@ -1630,17 +2461,22 @@ if stage_4_input and api_key:
             style_prompt=selected_style["prompt"],
             custom_instructions=custom_instructions,
             loc_map=loc_map,
+            glossary_text=glossary_text,
         )
         model_id = MODEL_POLICY["stage_4"]["model"]
-        pages = split_into_pages(stage_4_input)
+        batches, pat_label, n_scenes = split_into_scene_batches(
+            stage_4_input, scenes_per_batch, pattern=r'^[ \t]*〇')
+        st.info(f"🎬 〇柱 기준 {n_scenes}씬 → {len(batches)}배치")
 
         progress_bar = st.progress(0)
         status_area = st.empty()
 
-        results = run_stage_on_pages(
-            client, pages, system_prompt, model_id,
-            "Stage 4: Dialogue Polish", progress_bar, status_area
+        results, batch_report = run_stage_on_batches(
+            client, batches, system_prompt, model_id,
+            "Stage 4: Dialogue Polish", progress_bar, status_area,
+            scene_pattern=r'^[ \t]*〇', carry_context=carry_context,
         )
+        st.session_state["batch_report_4"] = batch_report
 
         if results is not None:
             st.session_state["stage_4_result"] = "\n\n".join(results)
@@ -1667,6 +2503,7 @@ if stage_5_input and api_key:
         system_prompt = build_stage5_prompt(
             char_map=char_map,
             loc_map=loc_map,
+            glossary_text=glossary_text,
         )
         model_id = MODEL_POLICY["stage_5"]["model"]
 
@@ -1707,6 +2544,68 @@ if st.session_state.get("stage_5_result"):
 
 
 # ═══════════════════════════════════════════════════
+# ★ v2.0 — VALIDATION GATE (원본 대비 분량·표기 대조)
+# 씬이 사라졌는데 모르고 완성본을 내보내는 사고를 막는다.
+# ═══════════════════════════════════════════════════
+st.markdown("---")
+st.markdown("### 🚦 VALIDATION GATE — 출고 전 검증")
+st.caption("원본 한국어 원고와 번역 결과를 대조합니다. 씬 수·글자 수·대사 수·금지 표기를 봅니다.")
+
+_gate_target = (
+    st.session_state.get("stage_4_result")
+    or st.session_state.get("stage_3_result")
+    or st.session_state.get("stage_2_result")
+    or st.session_state.get("stage_1_result")
+)
+
+if not source_text.strip():
+    st.caption("⏳ 원본 원고가 있어야 대조할 수 있습니다.")
+elif not _gate_target:
+    st.caption("⏳ 번역 결과가 있어야 대조할 수 있습니다.")
+else:
+    if st.button("🚦 검증 실행", key="btn_gate", use_container_width=True):
+        st.session_state["gate_result"] = run_validation_gate(
+            source_text, _gate_target, char_cues
+        )
+
+    gate = st.session_state.get("gate_result")
+    if gate:
+        if gate["passed"]:
+            st.success("✅ 전 항목 통과 — 분량 소실과 표기 위반이 검출되지 않았습니다.")
+        else:
+            st.error(
+                "❌ **검증 실패 — 이 상태로 내보내면 안 됩니다.** "
+                "아래 실패 항목을 해결한 뒤 다시 실행하세요."
+            )
+        st.table(gate["rows"])
+
+        if gate.get("forbidden"):
+            st.warning("**대사 헤드에 이름 표기가 쓰였습니다** — AUDIT의 '🎭 대사 헤드 통일'로 정리됩니다")
+            st.table([
+                {"쓰인 표기": a, "확정 헤드": b, "건수": n}
+                for a, b, n in gate["forbidden"]
+            ])
+
+    # ── 배치 리포트 ──
+    _reports = [
+        ("Stage 1", st.session_state.get("batch_report_1")),
+        ("Stage 3", st.session_state.get("batch_report_3")),
+        ("Stage 4", st.session_state.get("batch_report_4")),
+    ]
+    _reports = [(n, r) for n, r in _reports if r]
+    if _reports:
+        with st.expander("📊 배치별 실행 리포트 (절단·씬 누락 추적)", expanded=False):
+            for name, rep in _reports:
+                trunc = [r for r in rep if r["절단"].startswith("⚠️")]
+                lost = [r for r in rep if r["입력 씬"] and r["출력 씬"] < r["입력 씬"]]
+                st.markdown(
+                    f"**{name}** — 배치 {len(rep)}개 · "
+                    f"절단 {len(trunc)}건 · 씬 누락 배치 {len(lost)}개"
+                )
+                st.table(rep)
+
+
+# ═══════════════════════════════════════════════════
 # ★ v1.1 — LOCALIZATION AUDIT (대조표 잔존 검수)
 # ═══════════════════════════════════════════════════
 st.markdown("---")
@@ -1725,7 +2624,7 @@ if not (char_map or count_loc_entries(loc_map)):
 elif not _audit_source:
     st.caption("⏳ 번역 결과가 있어야 검수할 수 있습니다.")
 else:
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
 
     with col_a:
         if st.button("🔎 검수 실행", key="btn_audit", use_container_width=True):
@@ -1734,16 +2633,25 @@ else:
             )
 
     with col_b:
-        if st.button("🈶 한글 잔존 강제 치환", key="btn_ko_fix", use_container_width=True):
+        if st.button("🈶 한글 잔존 치환", key="btn_ko_fix", use_container_width=True):
             fixed, log = apply_korean_residue_fix(_audit_source, char_map, loc_map)
             st.session_state["enforced_result"] = fixed
             st.session_state["enforce_log"] = log
 
     with col_c:
+        if st.button("🎭 대사 헤드 통일", key="btn_cue_unify", use_container_width=True):
+            fixed, log = unify_dialogue_cues(_audit_source, char_cues)
+            st.session_state["enforced_result"] = fixed
+            st.session_state["enforce_log"] = log
+
+    with col_d:
         if st.button("🛠 구판 오표기 치환", key="btn_enforce", use_container_width=True):
             fixed, log = apply_glossary_enforcement(_audit_source, loc_map)
             st.session_state["enforced_result"] = fixed
             st.session_state["enforce_log"] = log
+
+    if not char_cues:
+        st.caption("💡 대사 헤드 통일은 대조표에 '대사 헤드(일)' 열이 있을 때 동작합니다.")
 
     # ── 검수 리포트 ──
     report = st.session_state.get("audit_report")
@@ -1852,6 +2760,35 @@ if final_result:
     else:
         st.caption("⚠️ Stage 1 (Raw Translation) 결과 기준 — 추가 폴리시 권장")
 
+    # ── ★ v2.0 — 출력 정규화 후처리 ──
+    final_result, _norm_stats = normalize_screenplay_text(final_result)
+    if _norm_stats:
+        st.caption(
+            "🧹 서식 정규화 적용 — "
+            + " · ".join(f"{k} {v}건" for k, v in _norm_stats.items())
+        )
+
+    # ── DOCX 출력 옵션 (v1.3) ──
+    with st.expander("📐 DOCX 출력 옵션", expanded=False):
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            opt_cover = st.checkbox(
+                "표지 페이지 생성", value=True, key="opt_cover",
+                help="첫 柱 앞의 제목·작가명·저작권 번호 블록을 표지로 분리합니다.",
+            )
+            opt_pageno = st.checkbox(
+                "페이지 번호 (푸터)", value=True, key="opt_pageno",
+                help="표지를 제외하고 하단 중앙에 번호를 넣습니다.",
+            )
+        with oc2:
+            opt_sceneno = st.checkbox(
+                "柱에 씬 번호 부여", value=False, key="opt_sceneno",
+                help="〇1　場所（時間） 형태. 일본 企画モード 표준은 번호 없음입니다.",
+            )
+            opt_studio = st.text_input(
+                "표지 하단 제작사 표기", value="BLUE JEANS PICTURES", key="opt_studio",
+            )
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -1866,7 +2803,13 @@ if final_result:
 
     with col2:
         try:
-            docx_bytes = generate_docx(final_result)
+            docx_bytes = generate_docx(
+                final_result,
+                make_cover=st.session_state.get("opt_cover", True),
+                page_numbers=st.session_state.get("opt_pageno", True),
+                scene_numbers=st.session_state.get("opt_sceneno", False),
+                studio_name=st.session_state.get("opt_studio", "") or "",
+            )
             st.download_button(
                 "📥 DOCX 다운로드 (横書き A4)",
                 data=docx_bytes,
@@ -1882,7 +2825,8 @@ if final_result:
     if st.button("🗑️ 전체 초기화 (새 프로젝트)", use_container_width=True):
         for key in ["stage_1_result", "stage_2_result", "stage_3_result",
                      "stage_4_result", "stage_5_result", "last_error",
-                     "audit_report", "enforced_result", "enforce_log"]:
+                     "audit_report", "enforced_result", "enforce_log",
+                     "gate_result", "batch_report_1", "batch_report_3", "batch_report_4"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()

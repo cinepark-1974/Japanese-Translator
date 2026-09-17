@@ -15,6 +15,36 @@ Keigo Tags: keigo / teinei / tameguchi / kenson / ibar
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v2.0 (2026-09-18)
+  - 메이저: 「번역 엔진 결함 분석 의견서」(2026-09-18) 반영
+    「상속」 일본어판이 원문의 41% 분량에서 잘린 사고에 대한 구조 수정.
+  - 신설 상수: NO_COMPRESSION_RULE
+    씬 누락·대사 삭제·씬 통합·후반 압축 금지를 전 스테이지에 강제 주입.
+    출력 전 柱 개수 자가 대조 지시 포함.
+  - 신설 함수: build_glossary_block()
+    작품별 고정 용어집(MD)을 매 호출 시스템 프롬프트에 통째로 주입.
+    프롬프트 내 다른 지시와 충돌 시 용어집이 우선하도록 최우선 권위 부여.
+  - build_stage1/3/4/5_prompt()에 glossary_text 인자 추가
+  - SCREENPLAY_FORMAT 서식 규칙 교체 (사용자 확정 서식 7조 반영)
+    · 柱: 〇 직후 공백 금지
+    · セリフ: 話者名 직후 공백 금지
+    · 連続セリフ: 2행 이후는 話者名 생략, 「」만 — v1.3 규칙을 뒤집음
+    · 動作 지문은 カギ括弧 안쪽, V.O./声のみ は 바깥
+    · 초출 표기: フルネーム（年代） — 성별 미표기
+  - STAGE_5 QA에 COMPLETENESS 섹션 신설 (씬 수 일치·후반 희석·설정 누락)
+  - build_stage4_prompt()에 SCREENPLAY_FORMAT 누락분 보강
+
+v1.3 (2026-09-18)
+  - 실제 출력물(「상속」 일본어판 DOCX) 분석 결과 반영 — 포맷 룰 보강
+  - SCREENPLAY_FORMAT 확장
+    · 人物名（セリフ頭）표기 통일 룰 신설 — 姓/名 혼용 금지
+      (실출력에서 神崎 30 vs 遼 14, 高村 50 vs 徹 7 혼용 확인)
+    · 連続セリフ 규칙 신설 — 2행 이후에도 반드시 人物名 표기
+      (실출력에서 人物名 없는 「」 단독 행 29건 확인)
+    · インサート・画面表示 서식 규정 — セリフ가 아닌 ト書き로 작성
+  - _build_char_map_section()에 대사 헤드 고정 지시 추가
+  - STAGE_5 QA 체크리스트에 人物名 혼용·連続セリフ·인서트 오기 항목 추가
+
 v1.2 (2026-09-17)
   - 기능 추가: 프로젝트 세션 백업 (JSON 중간 저장/불러오기)
     단계 중단 시 Stage 1~5 번역 결과와 로컬라이징 매핑을 JSON으로 저장하고
@@ -52,7 +82,7 @@ v1.0
 # ENGINE VERSION (세만틱 버저닝)
 # ═══════════════════════════════════════════════════
 
-ENGINE_VERSION = "1.2"
+ENGINE_VERSION = "2.0"
 ENGINE_BUILD_DATE = "2026-09-17"
 
 
@@ -260,7 +290,10 @@ SCREENPLAY_FORMAT = """
 ## SCREENPLAY FORMAT: 日本式企画モード（横書き）
 
 ### 柱（場所・時間帯）
-- 行頭に〇を書く。〇の後に場所と時間帯。
+- 行頭に〇を書く。**〇の直後に空白を入れない。**
+  ✅ 〇東京国税局・課税第一部 資産課税課（午後）
+  ❌ 〇 東京国税局・課税第一部 資産課税課（午後）
+- 〇の後に場所と時間帯。
 - INT./EXT.は使わない。
 - 場所は「・」で階層区分: 〇青湖ペンション・カウンター（朝）
 - 時間帯は末尾（）に: （夜）（朝）（夕方）（夜明け）
@@ -271,15 +304,47 @@ SCREENPLAY_FORMAT = """
 - 現在形で書く。過去形は使わない。
 - 体言止めを活用して映像的リズム: 「ため息。帳簿を確認する。」
 - 「〜している」の連続を避ける。
-- 初登場人物: フルネーム（年齢、性別）で表記。
+- 初登場人物: フルネーム（年代）で表記。性別は書かない。
+  ✅ 神崎遼（40代）
+  ❌ 神崎遼（40代、男）
 
 ### セリフ
-- 人物名を行頭に。
+- 話者名を行頭に。**話者名の後ろに空白を入れない。**
+  ✅ 高村「査察に切り替えます」
+  ❌ 高村 「査察に切り替えます」
 - セリフは「」（カギカッコ）で囲む。
 - 文末に句点（。）は付けない。
-- 声のみ: 人物名（声のみ）「セリフ」
-- 画面外: 人物名（OFF）「セリフ」
-- 演技指示: 「」内の冒頭に（）: 「（苦笑いで）大丈夫ですよ」
+- 演技・動作の指示は**カギカッコの内側**に置く。
+  ✅ 水野「（書類をめくり）これは何ですか」
+  ❌ 水野（書類をめくり）「これは何ですか」
+- V.O. / 声のみ / OFF は**カギカッコの外側**、話者名の直後に置く。
+  ✅ 黒木（V.O.）「……」
+  ✅ 高村（声のみ）「……」
+
+### 人物名（セリフ頭）の表記統一 — 最重要
+- 一人の登場人物には、作品全体で**ただ一つの人物名表記**を使う。
+- キャラクターマップに「대사 헤드（セリフ頭）」が指定されている場合、その表記が絶対である。
+- 姓と名を場面ごとに使い分けてはならない。
+  ❌ ある場面では「神崎「…」」、別の場面では「遼「…」」
+  ✅ 全篇を通して「神崎「…」」
+- ト書きの中でも同じ表記を使う。初出のフルネーム（年齢、性別）紹介の直後からは、
+  指定された人物名表記に切り替え、以後ぶれさせない。
+- 同姓の人物が複数いる等でやむを得ず区別が必要な場合のみ、フルネームを使う。
+
+### 同一人物が続けて話す場合
+- 二行目以降は**話者名を繰り返さず、「セリフ」だけの行**にする。
+  ✅ 神崎「父です」
+     「毎晩、パソコンの前で朝を迎える人でした」
+  ❌ 神崎「父です」
+     神崎「毎晩、パソコンの前で朝を迎える人でした」
+- 話者が変わったら必ず話者名を書く。
+
+### インサート・画面表示
+- 画面内の文字・スマホ画面・ニュース字幕は、セリフではなくト書きとして書く。
+- 書式: インサート。〈対象〉。「表示される文字」
+  例) インサート。高村のスマホ。「佐久間に送信 三件 — 既読」
+- 【 】や［ ］で画面を示す場合も同様にト書き扱い。
+- 字幕カードは行頭に「字幕——」を置く。
 
 ### 転換表現
 - CUT TO → カットバック。
@@ -340,6 +405,33 @@ One untranslated Korean element invalidates the entire draft.
 - 韓国式公務員級数（9級、8級）
 - 括弧内の「韓国では〜」という説明書き
 - 同一人物・同一機関に2つ以上の日本語表記"""
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.0 — NO-COMPRESSION RULE
+# 분량 소실(씬 누락·대사 삭제·씬 통합) 방지
+# ═══════════════════════════════════════════════════
+
+NO_COMPRESSION_RULE = """
+## COMPLETENESS — ABSOLUTE
+原稿を一行も落とさない。これは要約でも脚色でもなく、全文の移し替えである。
+
+### 禁止
+- シーンを飛ばす、まとめる、統合する
+- セリフを削る、二つのセリフを一つにする
+- ト書きを短くまとめる、複数のト書きを一文にする
+- 「以下同様」「（中略）」のような省略記号を書く
+- 終わりに近づいたからといって展開を早める
+
+### 義務
+- 受け取ったテキストに柱（シーン見出し）が N 個あれば、出力にも必ず N 個ある。
+- 受け取ったセリフの数と、出力のセリフの数が一致する。
+- 最後の一行まで、最初の一行と同じ密度で訳す。
+- 分量が多くても縮めない。長さは問題ではない。欠落だけが問題である。
+
+### 自己点検
+出力する前に、受け取ったテキストの柱を数え、自分の出力の柱を数えて、
+同じ数であることを確認する。違っていたら、落とした分を書き足してから返す。"""
 
 
 # ═══════════════════════════════════════════════════
@@ -572,6 +664,19 @@ Perform a final check on this translated and polished Japanese screenplay.
 - [ ] セリフ: 人物名行頭、「」カギカッコ、文末句点なし
 - [ ] 転換: カットバック / インサート etc. correct
 - [ ] 初登場: フルネーム（年齢、性別）表記
+- [ ] 人物名表記の統一: 同一人物が姓と名で混用されていないか
+      （例: 神崎「」と遼「」が混在していないか — 混在は必ず指摘する）
+- [ ] 連続セリフ: 同一人物の二行目以降が「」だけになっているか（話者名を繰り返していないか）
+- [ ] 柱の〇の直後に空白がないか
+- [ ] 話者名の直後に空白がないか
+- [ ] 動作のト書きがカギカッコの内側にあるか（V.O./声のみ は外側）
+- [ ] 画面内文字・インサートがセリフとして書かれていないか
+
+### COMPLETENESS（最重要）
+- [ ] 原文のシーン数と訳文のシーン数が一致しているか
+- [ ] 省略・要約・統合された箇所がないか
+- [ ] 後半になるほど記述が薄くなっていないか（出力打ち切りの兆候）
+- [ ] 回収されているのに設定シーンが存在しない台詞がないか
 
 ### KEIGO CONSISTENCY
 - [ ] Each character's keigo level matches their tag throughout
@@ -620,6 +725,8 @@ SCORE: [X]/10
 
 FORMAT ISSUES:
 - [list any format problems, or "None found"]
+- [人物名が姓/名で混用されている人物を全て挙げる, or "None found"]
+- [人物名のない「」だけのセリフ行があれば挙げる, or "None found"]
 
 KEIGO ISSUES:
 - [list any keigo consistency problems, or "None found"]
@@ -652,14 +759,39 @@ Be thorough but fair. A score of 8+ means ready for pitch submission to Japanese
 # PROMPT BUILDER FUNCTIONS
 # ═══════════════════════════════════════════════════
 
+def build_glossary_block(glossary_text: str) -> str:
+    """사용자가 올린 고정 용어집(MD)을 시스템 프롬프트 블록으로 감싼다. (v2.0)
+
+    매 호출의 시스템 프롬프트에 통째로 주입한다. 대화 이력에 의존하지 않으므로
+    배치가 몇 개로 나뉘든 표기가 흔들리지 않는다.
+    """
+    text = (glossary_text or "").strip()
+    if not text:
+        return ""
+    return f"""
+## ★★★ FIXED GLOSSARY — HIGHEST AUTHORITY ★★★
+以下は作品固有の確定用語集である。
+本プロンプト内の他のどの指示とも矛盾する場合、この用語集が優先する。
+一字一句、この表記のまま使う。言い換え・省略・独自判断を一切しない。
+
+{text}
+
+## ★★★ END OF FIXED GLOSSARY ★★★"""
+
+
 def build_stage1_prompt(
     char_map: dict,
     style_prompt: str,
     custom_instructions: str = "",
-    loc_map: dict = None
+    loc_map: dict = None,
+    glossary_text: str = ""
 ) -> str:
-    """Build Stage 1 (Raw Translation) system prompt. (v1.1 — loc_map 추가)"""
+    """Build Stage 1 (Raw Translation) system prompt. (v2.0 — 압축 금지 + 고정 용어집)"""
     parts = [STAGE_1_RAW_TRANSLATION]
+
+    # ★ v2.0 — 분량 소실 방지 (최우선)
+    parts.append(NO_COMPRESSION_RULE)
+
     parts.append(SCREENPLAY_FORMAT)
     parts.append(CURRENCY_RULE)
     parts.append(CULTURAL_CODE_MAP)
@@ -681,6 +813,11 @@ def build_stage1_prompt(
     if custom_instructions.strip():
         parts.append(f"\n## ADDITIONAL INSTRUCTIONS\n{custom_instructions.strip()}")
 
+    # ★ v2.0 — 고정 용어집은 맨 마지막(= 최우선 권위)에 둔다
+    gl = build_glossary_block(glossary_text)
+    if gl:
+        parts.append(gl)
+
     return "\n".join(parts)
 
 
@@ -689,10 +826,12 @@ def build_stage3_prompt(
     char_tones: dict,
     style_prompt: str,
     custom_instructions: str = "",
-    loc_map: dict = None
+    loc_map: dict = None,
+    glossary_text: str = ""
 ) -> str:
-    """Build Stage 3 (Voice Rewrite) system prompt. (v1.1 — loc_map 추가)"""
+    """Build Stage 3 (Voice Rewrite) system prompt. (v2.0 — 압축 금지 + 고정 용어집)"""
     parts = [STAGE_3_VOICE_REWRITE]
+    parts.append(NO_COMPRESSION_RULE)
     parts.append(SCREENPLAY_FORMAT)
     parts.append(CURRENCY_RULE)
     parts.append(CULTURAL_CODE_MAP)
@@ -717,6 +856,10 @@ def build_stage3_prompt(
     if custom_instructions.strip():
         parts.append(f"\n## ADDITIONAL INSTRUCTIONS\n{custom_instructions.strip()}")
 
+    gl = build_glossary_block(glossary_text)
+    if gl:
+        parts.append(gl)
+
     return "\n".join(parts)
 
 
@@ -725,10 +868,13 @@ def build_stage4_prompt(
     char_tones: dict,
     style_prompt: str,
     custom_instructions: str = "",
-    loc_map: dict = None
+    loc_map: dict = None,
+    glossary_text: str = ""
 ) -> str:
-    """Build Stage 4 (Dialogue Polish) system prompt. (v1.1 — loc_map 추가)"""
+    """Build Stage 4 (Dialogue Polish) system prompt. (v2.0 — 압축 금지 + 고정 용어집)"""
     parts = [STAGE_4_DIALOGUE_POLISH]
+    parts.append(NO_COMPRESSION_RULE)
+    parts.append(SCREENPLAY_FORMAT)
     parts.append(CULTURAL_CODE_MAP)
 
     # ★ v1.1 — Localization rules
@@ -751,11 +897,16 @@ def build_stage4_prompt(
     if custom_instructions.strip():
         parts.append(f"\n## ADDITIONAL INSTRUCTIONS\n{custom_instructions.strip()}")
 
+    gl = build_glossary_block(glossary_text)
+    if gl:
+        parts.append(gl)
+
     return "\n".join(parts)
 
 
-def build_stage5_prompt(char_map: dict = None, loc_map: dict = None) -> str:
-    """Build Stage 5 (QA Check) system prompt. (v1.1 — loc_map 대조 검증)"""
+def build_stage5_prompt(char_map: dict = None, loc_map: dict = None,
+                        glossary_text: str = "") -> str:
+    """Build Stage 5 (QA Check) system prompt. (v2.0 — 고정 용어집 대조)"""
     parts = [STAGE_5_QA_CHECK]
     parts.append(SCREENPLAY_FORMAT)
     parts.append(CURRENCY_RULE)
@@ -767,6 +918,10 @@ def build_stage5_prompt(char_map: dict = None, loc_map: dict = None) -> str:
     loc_section = build_localization_section(loc_map)
     if loc_section:
         parts.append(loc_section)
+
+    gl = build_glossary_block(glossary_text)
+    if gl:
+        parts.append(gl)
 
     return "\n".join(parts)
 
@@ -785,6 +940,8 @@ Replace ALL Korean character names with their Japanese equivalents:
 
 Apply to: 柱, ト書き, セリフ, 人物名（대사 헤드）, 括弧内の演技指示, 画面内テキスト — all mentions.
 First appearance: フルネーム（年齢、性別）.
+セリフ頭の人物名は、初出紹介の後は作品全体で一つの表記に固定する。
+姓と名を場面ごとに使い分けない（神崎「」と遼「」の混在は欠陥）。
 Adapt Korean honorific usage (e.g., "수현아", "지훈씨") into natural Japanese per keigo rules.
 Any name NOT listed: invent a natural Japanese name and use it consistently.
 NEVER transliterate a Korean name into katakana (キム / パク / ハン / カン は禁止)."""
