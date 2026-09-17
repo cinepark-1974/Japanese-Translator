@@ -15,6 +15,11 @@ Keigo Tags: keigo / teinei / tameguchi / kenson / ibar
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v1.2 (2026-09-17)
+  - 기능 추가: 프로젝트 세션 백업 (JSON 중간 저장/불러오기)
+    단계 중단 시 Stage 1~5 번역 결과와 로컬라이징 매핑을 JSON으로 저장하고
+    다음 작업 때 복원해 이어서 진행 가능. (main.py 구현)
+
 v1.1.1 (2026-09-17)
   - 버그 수정: MODEL_POLICY 모델 ID 갱신 (404 not_found_error 해결)
     claude-sonnet-4-20250514 → claude-sonnet-5
@@ -47,7 +52,7 @@ v1.0
 # ENGINE VERSION (세만틱 버저닝)
 # ═══════════════════════════════════════════════════
 
-ENGINE_VERSION = "1.1.1"
+ENGINE_VERSION = "1.2"
 ENGINE_BUILD_DATE = "2026-09-17"
 
 
