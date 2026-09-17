@@ -43,6 +43,7 @@ import io
 import csv
 import json
 import time
+from datetime import datetime
 
 from prompt import (
     ENGINE_VERSION,
@@ -180,6 +181,90 @@ div[data-testid="stFileUploader"] { background-color: #fff !important; border-ra
 # ─────────────────────────────────────────────
 MAX_CHARS_PER_PAGE = 8000
 VERSION = ENGINE_VERSION  # prompt.py 단일 출처 — 버전 표기 일원화
+
+
+# ═══════════════════════════════════════════════════
+# ★ v1.2 — 프로젝트 세션 백업 (JSON 저장/불러오기)
+# 단계 중단 시 그 시점까지의 원고·결과 전체를 JSON으로 저장하고,
+# 불러오면 멈춘 지점부터 그대로 이어서 진행할 수 있게 한다.
+# ═══════════════════════════════════════════════════
+
+# 백업 대상 키 — 원고 입력 + 5단계 결과 + 로컬라이징 매핑
+# (타겟 장르/지시사항은 실행 시 위젯에서 다시 읽는 구조라 제외.
+#  파일 업로드 원고도 텍스트 변환 후 세션에 남지 않아 제외 — 결과는 복원됨.)
+_BACKUP_KEYS = [
+    # 원고 입력
+    "project_title", "paste_pages",
+    # 5단계 번역 결과
+    "stage_1_result", "stage_2_result", "stage_3_result",
+    "stage_4_result", "stage_5_result",
+    # 로컬라이징 매핑 (대조표 재업로드 없이 복구)
+    "saved_char_map", "saved_char_tones", "saved_loc_map", "saved_char_yomi",
+]
+
+_STAGE_KEYS = [
+    "stage_1_result", "stage_2_result", "stage_3_result",
+    "stage_4_result", "stage_5_result",
+]
+
+
+def export_session_backup() -> bytes:
+    """현재 세션 상태(원고 + 단계 결과 + 매핑)를 JSON bytes로 직렬화한다."""
+    session = {k: st.session_state.get(k) for k in _BACKUP_KEYS}
+
+    # 붙여넣기 페이지(paste_page_0, paste_page_1 ...)는 동적 키라 따로 수집
+    pages = {}
+    page_count = st.session_state.get("paste_pages", 1) or 1
+    for i in range(page_count):
+        key = f"paste_page_{i}"
+        if key in st.session_state:
+            pages[key] = st.session_state.get(key, "")
+    session["_paste_pages_data"] = pages
+
+    done = sum(1 for k in _STAGE_KEYS if st.session_state.get(k))
+
+    payload = {
+        "_meta": {
+            "engine": "Japanese-Translator",
+            "engine_version": ENGINE_VERSION,
+            "build_date": ENGINE_BUILD_DATE,
+            "saved_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "title": st.session_state.get("project_title", "") or "Untitled",
+            "stage_progress": f"{done}/5",
+        },
+        "session": session,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def import_session_backup(raw_bytes: bytes) -> dict:
+    """백업 JSON bytes를 받아 세션에 복원한다. 복원된 메타 정보 dict를 반환한다."""
+    raw = raw_bytes.decode("utf-8")
+    data = json.loads(raw)
+
+    session_data = data.get("session", {})
+    meta = data.get("_meta", {})
+
+    for k in _BACKUP_KEYS:
+        if k in session_data:
+            st.session_state[k] = session_data[k]
+
+    pages = session_data.get("_paste_pages_data", {})
+    if isinstance(pages, dict):
+        for key, val in pages.items():
+            st.session_state[key] = val
+
+    return meta
+
+
+def make_backup_filename(title: str, done_count: int) -> str:
+    """백업 파일명 생성 — 제목/진행도/시각 포함."""
+    base = (title or "Untitled").strip()[:30]
+    for ch in '<>:"/\\|?*':
+        base = base.replace(ch, "_")
+    base = base.replace(" ", "_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    return f"JPTranslator_{base}_{done_count}of5_{ts}.json"
 
 
 # ─────────────────────────────────────────────
@@ -1237,6 +1322,80 @@ with st.expander("📋 CSV / TXT 인물표 예시 보기"):
 # ═══════════════════════════════════════════════════
 # INPUT
 # ═══════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════
+# ★ v1.2 — 프로젝트 세션 백업 (중단 시 복구용)
+# ═══════════════════════════════════════════════════
+with st.expander("💾 프로젝트 세션 백업 (중단 시 복구용)", expanded=False):
+    st.caption(
+        "현재까지의 원고와 단계별 번역 결과, 로컬라이징 대조표 매핑을 JSON으로 저장하거나 불러옵니다. "
+        "번역 도중 멈추거나 다음 날 이어서 작업할 때 사용합니다. "
+        "불러오면 멈춘 단계부터 그대로 이어서 진행할 수 있습니다."
+    )
+
+    col_b1, col_b2 = st.columns(2)
+
+    # ── 저장 ──
+    with col_b1:
+        st.markdown("**📥 백업 저장**")
+        _done = sum(1 for _k in _STAGE_KEYS if st.session_state.get(_k))
+        _backup_title = st.session_state.get("project_title", "") or "Untitled"
+        _backup_bytes = export_session_backup()
+        _backup_fname = make_backup_filename(_backup_title, _done)
+        st.download_button(
+            label=f"💾 JSON 다운로드 ({_done}/5 단계)",
+            data=_backup_bytes,
+            file_name=_backup_fname,
+            mime="application/json",
+            use_container_width=True,
+            key="backup_download_btn",
+        )
+        st.caption(f"파일명: `{_backup_fname}`")
+
+    # ── 불러오기 ──
+    with col_b2:
+        st.markdown("**📤 백업 불러오기**")
+        backup_file = st.file_uploader(
+            "백업 JSON 파일",
+            type=["json"],
+            key="backup_uploader",
+            label_visibility="collapsed",
+        )
+        load_backup_btn = st.button(
+            "📂 백업 적용 (현재 작업 덮어쓰기)",
+            use_container_width=True,
+            disabled=(backup_file is None),
+            key="backup_load_btn",
+        )
+
+        if load_backup_btn and backup_file is not None:
+            try:
+                meta = import_session_backup(backup_file.read())
+
+                saved_ver = meta.get("engine_version", "?")
+                saved_at = meta.get("saved_at", "?")
+                progress = meta.get("stage_progress", "?")
+                title = meta.get("title", "(무제)")
+
+                if saved_ver != ENGINE_VERSION:
+                    st.warning(
+                        f"⚠️ 백업 버전({saved_ver})이 현재 엔진({ENGINE_VERSION})과 다릅니다. "
+                        "복원은 시도되었으나 일부 신규 기능은 반영되지 않을 수 있습니다."
+                    )
+
+                st.success(
+                    f"✅ 백업 복원 완료\n\n"
+                    f"**프로젝트**: {title}\n\n"
+                    f"**저장 시각**: {saved_at}\n\n"
+                    f"**엔진 버전**: {saved_ver}\n\n"
+                    f"**진행도**: {progress} 단계"
+                )
+                st.rerun()
+            except json.JSONDecodeError as e:
+                st.error(f"JSON 파싱 실패: {e}")
+            except Exception as e:
+                st.error(f"복원 중 오류: {e}")
+
 
 st.markdown('<div class="section-header">📥 INPUT — 시나리오 입력 (한국어)</div>', unsafe_allow_html=True)
 
