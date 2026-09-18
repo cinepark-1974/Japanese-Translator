@@ -13,6 +13,25 @@ Pipeline:
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v2.1 (2026-09-18)
+  - [버그] Stage 5가 빈 응답을 그대로 저장하고 침묵하던 문제 (실사용 제보)
+    · 빈 문자열이 저장되면 `if result:` 가 False라 QA 박스가 안 뜨고,
+      `is None` 도 아니라 대기 안내조차 안 떠서 실행 여부를 알 수 없었다.
+    · 빈 응답·절단을 명시적으로 검출해 에러로 표시하도록 수정
+    · 저장된 결과가 비어 있으면 재실행 안내를 띄움
+  - Stage 5를 씬 배치 검수로 전환 — 30,000자 절단 폐기, 전량 검수
+    · 진행률 바 추가 (구버전은 진행 표시가 회색 한 줄뿐이었다)
+    · max_tokens 4,000 고정 → 배치 길이 기반 동적 산정
+    · 배치별 SCORE / RECOMMENDATION 집계 (평균·최저·수정 권고 배치 수)
+    · QA 리포트를 HTML div 대신 st.code() 로 안전 렌더
+  - [실측 반영] 출력 토큰 하한·계수 상향
+    「상속」 Stage 1 배치 17이 입력 2,554자 / 한도 8,000토큰에서 절단됨.
+    OUTPUT_TOKEN_RATIO 3.0 → 6.0, MIN_OUTPUT_TOKENS 8,000 → 16,000
+  - 빈 출력 가드를 전 배치 실행에 적용 (run_stage_on_batches)
+  - 씬 누락 화면 경고 추가 (기존에는 리포트에만 기록)
+  - 파이프라인 진행 상태 표시기 ①~⑤ (완료/진행/대기)
+  - 각 단계 완료 시 결과 자수·씬 수 배너 + 다음 단계 안내
+
 v2.0 (2026-09-18)
   - 메이저: 「번역 엔진 결함 분석 의견서」 반영 (원문 41% 분량 절단 사고)
   - [D-1] 씬 단위 배치 루프로 전환 — 글자 수 분할 폐기
@@ -243,9 +262,14 @@ VERSION = ENGINE_VERSION           # prompt.py 단일 출처 — 버전 표기 �
 # ★ v2.0 — 씬 단위 배치 기본값
 DEFAULT_SCENES_PER_BATCH = 4       # 한 번의 API 호출에 넣는 씬 수
 BATCH_CONTEXT_CHARS = 250          # 직전 배치 결과에서 넘겨줄 꼬리 문맥 길이
-MIN_OUTPUT_TOKENS = 8000           # 배치당 출력 토큰 하한
+# ★ v2.1 — 실측 반영
+#   「상속」 Stage 1 배치 17: 입력 2,554자 / 한도 8,000토큰에서 절단(max_tokens).
+#   일본어는 한자·가나의 토큰 효율이 낮아 자당 3토큰으로는 부족하다.
+#   또한 모델이 추론에 토큰을 쓰면 본문이 0자로 나올 수 있어 하한을 크게 잡는다.
+MIN_OUTPUT_TOKENS = 16000          # 배치당 출력 토큰 하한
 MAX_OUTPUT_TOKENS = 64000          # 배치당 출력 토큰 상한
-OUTPUT_TOKEN_RATIO = 3.0           # 입력 1자당 확보할 출력 토큰 (일본어 안전 계수)
+OUTPUT_TOKEN_RATIO = 6.0           # 입력 1자당 확보할 출력 토큰 (일본어 안전 계수)
+QA_SCENES_MULTIPLIER = 3           # QA 배치 = 번역 배치 × 3 (검수는 출력이 짧다)
 
 
 # ═══════════════════════════════════════════════════
@@ -1513,10 +1537,29 @@ def run_stage_on_batches(client, batches: list, system_prompt: str,
             "stop_reason": stop_reason or "-",
         })
 
+        # ★ v2.1 — 빈 출력 가드
+        #   모델이 추론에만 토큰을 쓰고 본문을 내지 않으면 빈 문자열이 온다.
+        #   그대로 저장하면 화면에 아무것도 안 뜨고 실패한 줄도 모른다.
+        if not out.strip():
+            msg = (
+                f"❌ 배치 {n} 출력이 비어 있습니다 (stop_reason: {stop_reason or '불명'}). "
+                f"출력 한도 {max_tok:,} 토큰. 배치 씬 수를 줄이고 다시 실행하세요."
+            )
+            st.error(msg)
+            st.session_state["last_error"] = msg
+            return None, report
+
         if truncated:
             st.error(
                 f"⚠️ 배치 {n} 출력이 토큰 한도({max_tok:,})에서 잘렸습니다. "
                 "배치 씬 수를 줄이고 다시 실행하세요."
+            )
+
+        # ★ v2.1 — 씬 누락 경고 (기존에는 리포트에만 남고 화면 경고가 없었다)
+        if in_scenes and out_scenes < in_scenes:
+            st.warning(
+                f"⚠️ 배치 {n} 씬 누락 — 입력 {in_scenes}씬 → 출력 {out_scenes}씬. "
+                "검증 게이트에서 최종 확인하세요."
             )
 
         results.append(out)
@@ -2300,10 +2343,47 @@ for key in ["stage_1_result", "stage_2_result", "stage_3_result", "stage_4_resul
     if key not in st.session_state:
         st.session_state[key] = None
 
+# ── ★ v2.1 — 파이프라인 진행 상태 표시기 ──
+_STAGE_LABELS = [
+    (1, "① Raw Translation", "stage_1_result"),
+    (2, "② Format", "stage_2_result"),
+    (3, "③ Voice Rewrite", "stage_3_result"),
+    (4, "④ Dialogue Polish", "stage_4_result"),
+    (5, "⑤ QA Check", "stage_5_result"),
+]
+_done_flags = [
+    bool(st.session_state.get(k) and str(st.session_state.get(k)).strip())
+    for _, _, k in _STAGE_LABELS
+]
+_badges = []
+_next_label = None
+for (num, label, _), done in zip(_STAGE_LABELS, _done_flags):
+    if done:
+        _badges.append(f'<span class="stage-badge stage-done">✓ {label}</span>')
+    elif _next_label is None:
+        _next_label = label
+        _badges.append(f'<span class="stage-badge stage-active">▶ {label}</span>')
+    else:
+        _badges.append(f'<span class="stage-badge stage-pending">{label}</span>')
 
-def show_stage_result(stage_num: int, stage_name: str, result_key: str):
+st.markdown(f'<div style="margin:0.3rem 0 0.8rem 0;">{"".join(_badges)}</div>',
+            unsafe_allow_html=True)
+if all(_done_flags):
+    st.success("🎉 5단계 전부 완료 — 아래 🚦 VALIDATION GATE 에서 검증 후 내보내세요.")
+elif _next_label:
+    st.caption(f"현재 진행 위치: **{_next_label}**")
+
+
+def show_stage_result(stage_num: int, stage_name: str, result_key: str,
+                      next_hint: str = ""):
+    """단계 결과 표시. (v2.1 — 완료 배너 + 씬 수 + 다음 단계 안내)"""
     result = st.session_state.get(result_key)
-    if result:
+    if result and str(result).strip():
+        scenes = len(re.findall(r'^[ \t]*〇', result, re.MULTILINE))
+        st.success(
+            f"✅ Stage {stage_num} 완료 — {len(result):,}자"
+            + (f" · {scenes}씬" if scenes else "")
+        )
         with st.expander(f"📄 Stage {stage_num} 결과 — {stage_name}", expanded=False):
             st.text(result[:5000] + ("..." if len(result) > 5000 else ""))
         st.download_button(
@@ -2314,6 +2394,10 @@ def show_stage_result(stage_num: int, stage_name: str, result_key: str):
             use_container_width=True,
             key=f"dl_stage_{stage_num}",
         )
+        if next_hint:
+            st.info(f"👉 **다음 단계** — {next_hint}")
+    elif result is not None and not str(result).strip():
+        st.warning(f"⚠️ Stage {stage_num} 결과가 비어 있습니다. 다시 실행해 주세요.")
 
 
 def upload_previous_result(stage_num: int, prev_stage_name: str, result_key: str):
@@ -2377,7 +2461,8 @@ if can_run:
             status_area.markdown('<div class="progress-text">✅ Stage 1 완료!</div>', unsafe_allow_html=True)
             st.rerun()
 
-show_stage_result(1, "Raw Translation", "stage_1_result")
+show_stage_result(1, "Raw Translation", "stage_1_result",
+                  "② Format Conversion 실행 (규칙 기반 · 무료 · API 호출 없음)")
 
 
 # ═══════════════════════════════════════════════════
@@ -2395,7 +2480,8 @@ if stage_2_input:
 elif st.session_state.get("stage_2_result") is None:
     st.caption("⏳ Stage 1을 먼저 완료하세요.")
 
-show_stage_result(2, "Format", "stage_2_result")
+show_stage_result(2, "Format", "stage_2_result",
+                  "③ Voice Rewrite 실행 (Opus · 번역체 제거)")
 
 
 # ═══════════════════════════════════════════════════
@@ -2440,7 +2526,8 @@ if stage_3_input and api_key:
 elif st.session_state.get("stage_3_result") is None:
     st.caption("⏳ Stage 2를 먼저 완료하세요.")
 
-show_stage_result(3, "Voice Rewrite", "stage_3_result")
+show_stage_result(3, "Voice Rewrite", "stage_3_result",
+                  "④ Dialogue Polish 실행 (Opus · 경어 설계)")
 
 
 # ═══════════════════════════════════════════════════
@@ -2485,7 +2572,8 @@ if stage_4_input and api_key:
 elif st.session_state.get("stage_4_result") is None:
     st.caption("⏳ Stage 3를 먼저 완료하세요.")
 
-show_stage_result(4, "Dialogue Polish", "stage_4_result")
+show_stage_result(4, "Dialogue Polish", "stage_4_result",
+                  "⑤ QA Check 실행. 건너뛰고 🚦 VALIDATION GATE로 바로 가도 됩니다.")
 
 
 # ═══════════════════════════════════════════════════
@@ -2496,7 +2584,16 @@ st.markdown("### ⑤ QA Check (Sonnet)")
 st.caption("최종 품질 검증. 포맷/경어/문화코드/스토리 체크리스트.")
 
 stage_5_input = upload_previous_result(5, "Stage 4 Dialogue Polish", "stage_4_result")
+
 if stage_5_input and api_key:
+    _qa_batch_size = int(scenes_per_batch) * QA_SCENES_MULTIPLIER
+    _qa_batches_preview, _, _qa_scenes = split_into_scene_batches(
+        stage_5_input, _qa_batch_size, pattern=r'^[ \t]*〇')
+    st.caption(
+        f"검수 대상 {len(stage_5_input):,}자 · {_qa_scenes}씬 → "
+        f"{len(_qa_batches_preview)}배치 ({_qa_batch_size}씬씩) 전량 검수합니다."
+    )
+
     if st.button("▶️ Stage 5 실행", key="btn_stage5", use_container_width=True):
         client = anthropic.Anthropic(api_key=api_key)
 
@@ -2507,39 +2604,92 @@ if stage_5_input and api_key:
         )
         model_id = MODEL_POLICY["stage_5"]["model"]
 
+        qa_batches, _, _ = split_into_scene_batches(
+            stage_5_input, _qa_batch_size, pattern=r'^[ \t]*〇')
+
+        progress_bar = st.progress(0)
         status_area = st.empty()
-        status_area.markdown(
-            '<div class="progress-text">🔍 QA 검증 중...</div>',
-            unsafe_allow_html=True
-        )
 
-        try:
-            qa_input = stage_5_input
-            if len(qa_input) > 30000:
-                qa_input = stage_5_input[:15000] + "\n\n[...中略...]\n\n" + stage_5_input[-15000:]
-
-            qa_report = call_api(
-                client, qa_input, system_prompt,
-                model_id, max_tokens=4000
+        reports = []
+        failed = None
+        for _i, _b in enumerate(qa_batches):
+            _n = _i + 1
+            _max_tok = max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS, int(len(_b) * 2)))
+            status_area.markdown(
+                f'<div class="progress-text">🔍 QA 검증 중 — 배치 {_n}/{len(qa_batches)} '
+                f'(입력 {len(_b):,}자 · 한도 {_max_tok:,} 토큰)</div>',
+                unsafe_allow_html=True
             )
-            st.session_state["stage_5_result"] = qa_report
-            status_area.markdown('<div class="progress-text">✅ Stage 5 완료!</div>', unsafe_allow_html=True)
+            try:
+                _out, _stop = call_api_ex(
+                    client, _b, system_prompt, model_id,
+                    max_tokens=_max_tok,
+                    page_info=f"QA batch {_n} of {len(qa_batches)}.",
+                )
+            except Exception as e:
+                failed = f"❌ QA 오류 (배치 {_n}): {type(e).__name__}: {e}"
+                break
+
+            # ★ v2.1 — 빈 응답 가드. 구버전은 빈 문자열을 그대로 저장해
+            #   화면에 아무것도 뜨지 않고 실패 사실조차 알 수 없었다.
+            if not _out.strip():
+                failed = (
+                    f"❌ QA 배치 {_n} 응답이 비어 있습니다 "
+                    f"(stop_reason: {_stop or '불명'} · 한도 {_max_tok:,} 토큰). "
+                    "배치당 씬 수를 줄이고 다시 실행하세요."
+                )
+                break
+
+            reports.append(
+                f"═══ QA BATCH {_n}/{len(qa_batches)} ═══\n{_out.strip()}"
+            )
+            progress_bar.progress(_n / len(qa_batches))
+
+        if failed:
+            st.error(failed)
+            st.session_state["last_error"] = failed
+        elif reports:
+            st.session_state["stage_5_result"] = "\n\n\n".join(reports)
             st.rerun()
-        except Exception as e:
-            st.error(f"❌ QA 오류: {e}")
-elif st.session_state.get("stage_5_result") is None:
+        else:
+            st.error("❌ QA 결과가 생성되지 않았습니다.")
+
+elif not stage_5_input:
     st.caption("⏳ Stage 4를 먼저 완료하세요.")
 
-if st.session_state.get("stage_5_result"):
+_qa_result = st.session_state.get("stage_5_result")
+if _qa_result and _qa_result.strip():
+    st.success(f"✅ Stage 5 완료 — QA 리포트 {len(_qa_result):,}자 생성됨")
+
+    # 배치별 SCORE / RECOMMENDATION 집계
+    _scores = [int(x) for x in re.findall(r'SCORE:\s*\[?(\d{1,2})\]?\s*/\s*10', _qa_result)]
+    _recs = re.findall(r'RECOMMENDATION:\s*\[?([A-Z ]+?)\]?\s*$', _qa_result, re.MULTILINE)
+    if _scores or _recs:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("평균 점수", f"{sum(_scores)/len(_scores):.1f} / 10" if _scores else "—")
+        m2.metric("최저 점수", f"{min(_scores)} / 10" if _scores else "—")
+        m3.metric("검수 배치", f"{len(_scores) or len(_recs)}개")
+        if _recs:
+            _bad = [r.strip() for r in _recs if "MAJOR" in r or "MINOR" in r]
+            if _bad:
+                st.warning(f"수정 권고 배치 {len(_bad)}개 — {', '.join(sorted(set(_bad)))}")
+            else:
+                st.success("전 배치 PASS")
+
     st.markdown("**🔍 QA Report**")
-    st.markdown(f'<div class="qa-box">{st.session_state["stage_5_result"]}</div>', unsafe_allow_html=True)
+    st.code(_qa_result, language="text")
     st.download_button(
         "💾 QA Report 저장 (TXT)",
-        data=st.session_state["stage_5_result"].encode("utf-8"),
+        data=_qa_result.encode("utf-8"),
         file_name="qa_report_jp.txt",
         mime="text/plain",
         use_container_width=True,
         key="dl_qa",
+    )
+    st.info("👉 **다음 단계** — 아래 🚦 VALIDATION GATE 에서 원본 대비 분량·표기를 검증하세요.")
+elif _qa_result is not None and not str(_qa_result).strip() and stage_5_input:
+    st.warning(
+        "⚠️ 이전 실행의 QA 결과가 비어 있습니다. 위 '▶️ Stage 5 실행'을 다시 눌러 주세요."
     )
 
 
