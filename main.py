@@ -125,6 +125,8 @@ from prompt import (
     ENGINE_VERSION,
     ENGINE_BUILD_DATE,
     NO_COMPRESSION_RULE,
+    build_stage6_style_prompt,
+    build_stage6_fix_prompt,
     STYLE_PRESETS,
     KEIGO_TONE_TAGS,
     MODEL_POLICY,
@@ -286,17 +288,17 @@ _BACKUP_KEYS = [
     "project_title", "paste_pages",
     # 5단계 번역 결과
     "stage_1_result", "stage_2_result", "stage_3_result",
-    "stage_4_result", "stage_5_result",
+    "stage_4_result", "stage_5_result", "stage_6_result", "stage_6_style_sheet",
     # 로컬라이징 매핑 (대조표 재업로드 없이 복구)
     "saved_char_map", "saved_char_tones", "saved_loc_map",
     "saved_char_yomi", "saved_char_cues", "saved_glossary_text",
     # 배치 실행 리포트
-    "batch_report_1", "batch_report_3", "batch_report_4",
+    "batch_report_1", "batch_report_3", "batch_report_4", "batch_report_6",
 ]
 
 _STAGE_KEYS = [
     "stage_1_result", "stage_2_result", "stage_3_result",
-    "stage_4_result", "stage_5_result",
+    "stage_4_result", "stage_5_result", "stage_6_result", "stage_6_style_sheet",
 ]
 
 
@@ -369,10 +371,15 @@ def make_backup_filename(title: str, done_count: int) -> str:
 # ═══════════════════════════════════════════════════
 
 # ── 시트 분류 키워드 (시트명에 포함되면 해당 분류) ──
+# ★ v2.2.0 — 판정 순서: 고정 대사 → 말투 지침 → 조·단역 → 법조문 → 현지화 항목 → 인물
+_SHEET_FIXED_KEYS = ["고정", "핵심 대사", "핵심대사", "locked", "fixed"]
+_SHEET_VOICE_KEYS = ["말투", "보이스", "voice", "어투", "화법"]
 _SHEET_EXTRAS_KEYS = ["단역", "조역", "조연", "端役", "extra", "minor", "bit"]
 _SHEET_LEGAL_KEYS = ["법조문", "법령", "법률", "조문", "직급", "법전", "legal"]
 _SHEET_PLACES_KEYS = ["지명", "기관", "장소", "용어", "명칭", "고유명사",
-                      "place", "location", "term"]
+                      "화면", "텍스트", "소품", "자막",
+                      "수치", "단위", "환산", "금액", "통화",
+                      "place", "location", "term", "prop"]
 
 # ── 헤더 컬럼 인식 키워드 ──
 _COL_KO_KEYS = ["한국명", "한국이름", "한국판", "한국어", "원문", "국문", "korean"]
@@ -385,6 +392,10 @@ _COL_CUE_KEYS = ["대사 헤드", "대사헤드", "cue"]      # 대사 헤드(�
 _COL_SHORT_KEYS = ["약칭", "short"]                   # 극중 축약 호칭 (석훈, 도현 …)
 _COL_TONE_KEYS = ["경어", "톤", "tone", "keigo"]
 _COL_WRONG_KEYS = ["v1", "수정 전", "수정전", "오표기", "before", "직역 상태"]
+# ★ v2.2.0 — 고정 대사 / 말투 지침 시트용
+_COL_SPEAKER_KEYS = ["화자", "인물", "캐릭터", "speaker", "character"]
+_COL_SCENE_KEYS = ["씬", "장면", "scene", "s#"]
+_COL_NOTE_KEYS = ["비고", "메모", "note", "remark"]
 
 
 def _norm_header(v) -> str:
@@ -486,6 +497,27 @@ def _is_safe_correction(bad: str, good: str) -> bool:
     return True
 
 
+def _match_char_name(name: str, char_map: dict) -> str:
+    """★ v2.2.0 — 말투 지침의 인물 표기를 인물표와 느슨하게 맞춘다.
+
+    '서광명 목사' / '최 집사' 처럼 직함이 붙어 있어도 본명으로 찾아낸다.
+    """
+    n = str(name or "").strip()
+    if not n:
+        return ""
+    if n in char_map:
+        return char_map[n]
+    # 공백·직함을 떼고 비교 (긴 키부터)
+    flat = re.sub(r"[\s　]", "", n)
+    for ko in sorted(char_map.keys(), key=len, reverse=True):
+        kf = re.sub(r"[\s　]", "", str(ko))
+        if not kf or len(kf) < 2:
+            continue
+        if kf in flat or flat in kf:
+            return char_map[ko]
+    return ""
+
+
 def parse_translation_workbook(uploaded_file):
     """XLSX 로컬라이징 대조표를 파싱한다. (v1.1)
 
@@ -514,7 +546,9 @@ def parse_translation_workbook(uploaded_file):
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
 
     char_map, char_tones, char_yomi, char_cues = {}, {}, {}, {}
-    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
+    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {},
+               "fixed_lines": [], "voice_notes": {}}
+    pending_voice = []   # 인물표를 다 읽은 뒤 일본어명과 연결
 
     # ── 사전 스캔: 어느 시트에 있든 '한국명 → 약칭'을 모아둔다 ──
     # (한·영·일 시트에는 약칭 열이 없고, 영문 시트에만 있는 경우가 많다)
@@ -540,7 +574,11 @@ def parse_translation_workbook(uploaded_file):
     for ws in wb.worksheets:
         sheet_name = str(ws.title).lower()
 
-        if any(k in sheet_name for k in _SHEET_EXTRAS_KEYS):
+        if any(k in sheet_name for k in _SHEET_FIXED_KEYS):
+            bucket = "fixed_lines"
+        elif any(k in sheet_name for k in _SHEET_VOICE_KEYS):
+            bucket = "voice_notes"
+        elif any(k in sheet_name for k in _SHEET_EXTRAS_KEYS):
             bucket = "extras"
         elif any(k in sheet_name for k in _SHEET_LEGAL_KEYS):
             bucket = "legal"
@@ -568,6 +606,44 @@ def parse_translation_workbook(uploaded_file):
 
         ko_i = _pick_column(headers, _COL_KO_KEYS)
         jp_i = _pick_column(headers, _COL_JP_KEYS, exclude_keys=_COL_JP_EXCLUDE)
+        data_rows = rows[header_idx + 1:]
+
+        def _cell(row, i, strip=False):
+            return _clean_term(row[i], strip_kr_note=strip) if (i >= 0 and len(row) > i) else ""
+
+        # ── ★ v2.2.0 핵심 대사 고정 번역 시트 ──
+        if bucket == "fixed_lines":
+            sp_i = _pick_column(headers, _COL_SPEAKER_KEYS)
+            sc_i = _pick_column(headers, _COL_SCENE_KEYS)
+            for row in data_rows:
+                if not row:
+                    continue
+                ko, jp = _cell(row, ko_i), _cell(row, jp_i)
+                # 일본어 값에 일본어 문자(가나·한자)가 있어야 유효
+                if ko and jp and re.search(r'[ぁ-んァ-ヶ一-龥]', jp):
+                    loc_map["fixed_lines"].append({
+                        "scene": _cell(row, sc_i),
+                        "speaker": _cell(row, sp_i),
+                        "ko": ko,
+                        "ja": jp,
+                    })
+            continue
+
+        # ── ★ v2.2.0 말투 지침 시트 ──
+        if bucket == "voice_notes":
+            sp_i = _pick_column(headers, _COL_SPEAKER_KEYS)
+            note_i = _pick_column(headers, _COL_NOTE_KEYS)
+            for row in data_rows:
+                if not row:
+                    continue
+                who, jp = _cell(row, sp_i), _cell(row, jp_i)
+                if not who:
+                    who = _cell(row, ko_i)
+                if who and jp:
+                    note = _cell(row, note_i)
+                    pending_voice.append((who, jp + (f" — {note}" if note else "")))
+            continue
+
         tone_i = _pick_column(headers, _COL_TONE_KEYS)
         yomi_i = _pick_column(headers, _COL_YOMI_KEYS)
         cue_i = _pick_column(headers, _COL_CUE_KEYS)
@@ -624,6 +700,13 @@ def parse_translation_workbook(uploaded_file):
                 for variant in _split_variants(wrong_raw):
                     if _is_safe_correction(variant, jp):
                         loc_map["corrections"][variant] = jp
+
+    # ★ v2.2.0 — 말투 지침을 일본어 인물 표기에 연결한다
+    #   '서광명 목사' 처럼 직함이 붙어 있어도 '서광명' 으로 찾아낸다
+    for who, note in pending_voice:
+        jp_name = _match_char_name(who, char_map)
+        label = f"{jp_name} ({who})" if jp_name else who
+        loc_map["voice_notes"][label] = note
 
     return char_map, char_tones, loc_map, char_yomi, char_cues
 
@@ -698,10 +781,54 @@ def unify_dialogue_cues(text: str, char_cues: dict) -> tuple:
 
 
 def count_loc_entries(loc_map: dict) -> int:
-    """loc_map 총 항목 수."""
+    """loc_map 총 항목 수. (dict / list 둘 다 집계)"""
     if not loc_map:
         return 0
-    return sum(len(v or {}) for v in loc_map.values())
+    return sum(len(v or []) for v in loc_map.values())
+
+
+def normalize_layout(text: str) -> str:
+    """★ v2.2.0 — 규칙 기반 정리 (API 비용 없음).
+
+    - 모든 줄 왼쪽 정렬 (DOCX 서식은 생성 단계에서 입힌다)
+    - "--" → 일본어 대시 "——"
+    - 3줄 이상 빈 줄 → 1줄
+    """
+    if not text:
+        return text
+    lines = [ln.strip() for ln in text.replace("\t", " ").split("\n")]
+    out = "\n".join(lines)
+    out = re.sub(r"[ 　]*--+[ 　]*", "——", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip() + "\n"
+
+
+def scene_heading_list(text: str) -> list:
+    """★ v2.2.0 — 柱(〇) 줄만 순서대로 뽑는다 (Stage 6 기준표용)."""
+    return [ln.strip() for ln in (text or "").split("\n")
+            if re.match(r'^[ \t　]*〇', ln)]
+
+
+def introduced_before(full_text: str, offset: int, char_cues: dict) -> list:
+    """★ v2.2.0 — offset 이전에 이미 등장한 인물의 대사 헤드 목록.
+
+    Stage 6의 F6(초출 이후에는 대사 헤드 표기만 사용)에 쓴다.
+    """
+    head = (full_text or "")[:offset].replace(" ", "")
+    found = []
+    for full_name, cue in (char_cues or {}).items():
+        probe = str(full_name).replace(" ", "")
+        if not probe or not cue:
+            continue
+        if probe in head or cue in head:
+            if cue not in found:
+                found.append(cue)
+    return found
+
+
+def locked_lines_ja(loc_map: dict) -> list:
+    """★ v2.2.0 — 고정 대사의 일본어 확정문만 뽑는다 (완결성 검사용)."""
+    return [f.get("ja") for f in (loc_map or {}).get("fixed_lines") or [] if f.get("ja")]
 
 
 def _build_ko_jp_pairs(char_map: dict, loc_map: dict) -> list:
@@ -1117,7 +1244,8 @@ def parse_glossary_json(uploaded_file):
     data = json.loads(raw)
 
     char_map, char_tones, char_yomi, char_cues = {}, {}, {}, {}
-    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
+    loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {},
+               "fixed_lines": [], "voice_notes": {}}
 
     for c in data.get("characters") or []:
         ko = str(c.get("ko") or "").strip()
@@ -1463,17 +1591,106 @@ def call_api_ex(client, text: str, system_prompt: str, model_id: str,
 
 
 def call_api(client, text: str, system_prompt: str, model_id: str,
-             max_tokens: int = 8000, page_info: str = "") -> str:
-    """Call Claude API with streaming to prevent timeout."""
-    out, _ = call_api_ex(client, text, system_prompt, model_id, max_tokens, page_info)
+             max_tokens: int = 32000, page_info: str = "") -> str:
+    """Call Claude API. (v2.2.0 — 문제가 있으면 예외를 던져 저장을 막는다)"""
+    out, stop = call_api_ex(client, text, system_prompt, model_id, max_tokens, page_info)
+    if stop == "max_tokens":
+        raise RuntimeError(
+            f"응답이 길이 한도({max_tokens:,} 토큰)에 걸려 중간에 끊겼습니다. "
+            "잘린 결과는 저장하지 않았습니다. prompt.py MODEL_POLICY의 max_tokens를 늘려 주세요."
+        )
+    if stop == "refusal":
+        raise RuntimeError("모델이 이 구간의 응답을 거부했습니다 (stop_reason: refusal).")
+    if not out.strip():
+        raise RuntimeError(
+            f"모델이 본문 없이 응답을 끝냈습니다 (stop_reason: {stop}). "
+            "빈 결과는 저장하지 않았습니다. 다시 실행해 주세요."
+        )
     return out
+
+
+def make_client(key: str):
+    """일시적 서버 혼잡(429/529 등)에 자동 재시도하는 클라이언트. (v2.2.0)"""
+    return anthropic.Anthropic(api_key=key, max_retries=5)
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.2.0 — 완결성 검사 · 재시도 · 이어하기
+# ═══════════════════════════════════════════════════
+
+# 출력 분량 하한 (입력 대비 글자 수 비율)
+#   한→일: 일본어가 한국어보다 약간 짧아지는 것이 정상
+#   일→일: 리라이트로 다소 줄 수 있으나 절반 이하로 줄면 누락
+_MIN_RATIO = {"ko2ja": 0.6, "ja2ja": 0.6, "fix": 0.9}
+# 기계적 수정(Stage 6)은 분량이 거의 변하지 않아야 한다
+_MAX_RATIO = {"fix": 1.15}
+
+
+def check_completeness(src: str, out: str, mode: str, locked: list = None) -> str:
+    """배치 단위 완결성 검사. 문제가 없으면 빈 문자열, 있으면 사유를 돌려준다. (v2.2.0)
+
+    locked: 고정 대사 일본어 목록. 입력에 있던 고정 대사가 출력에서 사라지면 실패.
+    """
+    src_heads = len(re.findall(r'^[ \t]*〇', src or "", re.MULTILINE))
+    out_heads = len(re.findall(r'^[ \t]*〇', out or "", re.MULTILINE))
+    if mode == "ko2ja":
+        src_heads = count_scenes(src or "")
+    if src_heads and out_heads < src_heads:
+        return f"씬 누락 — 입력 {src_heads}씬 / 출력 {out_heads}씬"
+
+    src_len = len((src or "").strip())
+    out_len = len((out or "").strip())
+    ratio = _MIN_RATIO.get(mode, 0.6)
+    if src_len >= 1500 and out_len < src_len * ratio:
+        return f"분량 부족 — 입력 {src_len:,}자 대비 출력 {out_len:,}자 (기준 {int(ratio*100)}% 미만)"
+    max_r = _MAX_RATIO.get(mode)
+    if max_r and src_len >= 1500 and out_len > src_len * max_r:
+        return f"변경 과다 — 입력 {src_len:,}자 대비 출력 {out_len:,}자 (기계적 수정 범위 초과)"
+
+    for ja in locked or []:
+        probe = re.split(r"\s*/\s*", str(ja))[0].strip()[:14]
+        if len(probe) >= 8:
+            pat = _flexible_pattern(probe)
+            if pat.search(src or "") and not pat.search(out or ""):
+                return f"고정 대사 훼손 — 「{probe}…」"
+    return ""
+
+
+def _job_signature(system_prompt: str, pages: list) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    h.update(system_prompt.encode("utf-8"))
+    for p in pages:
+        h.update(b"\x00")
+        h.update(p.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+_ALL_STAGE_KEYS = ["stage_1_result", "stage_2_result", "stage_3_result",
+                   "stage_4_result", "stage_5_result", "stage_6_result"]
+
+
+def clear_downstream(stage_num: int):
+    """★ v2.2.0 — 앞 단계를 다시 돌리면 그 뒤 단계 결과는 낡은 결과이므로 지운다."""
+    for n in range(stage_num + 1, 7):
+        st.session_state[f"stage_{n}_result"] = None
+        st.session_state.pop(f"partial_stage_{n}", None)
+    if stage_num < 6:
+        st.session_state.pop("stage_6_style_sheet", None)
+    for k in ("audit_report", "enforced_result", "enforce_log", "gate_result"):
+        st.session_state.pop(k, None)
 
 
 def run_stage_on_batches(client, batches: list, system_prompt: str,
                          model_id: str, stage_name: str,
                          progress_bar, status_area,
                          scene_pattern: str = None,
-                         carry_context: bool = True) -> tuple:
+                         carry_context: bool = True,
+                         max_tokens: int = None,
+                         stage_key: str = "",
+                         check_mode: str = "ja2ja",
+                         locked: list = None,
+                         batch_notes: list = None) -> tuple:
     """씬 단위 배치로 스테이지를 실행한다. (v2.0)
 
     - 배치마다 입력 길이에 맞춰 max_tokens 를 산정한다 (출력 잘림 방지)
@@ -1488,43 +1705,96 @@ def run_stage_on_batches(client, batches: list, system_prompt: str,
     total = len(batches)
     prev_tail = ""
 
-    for idx, batch in enumerate(batches):
+    # ★ v2.2.0 — 이어하기: 완료된 배치는 세션에 보관한다.
+    #   중간에 실패해도 다시 실행하면 실패한 배치부터 이어서 진행한다.
+    #   (설정·대조표·원고가 바뀌면 서명이 달라져 보관분을 자동 폐기)
+    sig = _job_signature(system_prompt, batches)
+    partial_key = f"partial_{stage_key}" if stage_key else ""
+    if partial_key:
+        saved = st.session_state.get(partial_key) or {}
+        if saved.get("sig") == sig:
+            results = list(saved.get("results") or [])
+            report = list(saved.get("report") or [])
+        if results:
+            st.info(f"↪️ 이전 실행에서 완료된 {len(results)}/{total} 배치를 이어서 사용합니다.")
+            progress_bar.progress(min(1.0, len(results) / total))
+            prev_tail = results[-1][-BATCH_CONTEXT_CHARS:]
+
+    for idx in range(len(results), total):
+        batch = batches[idx]
         n = idx + 1
-        max_tok = estimate_output_tokens(batch)
+        max_tok = int(max_tokens) if max_tokens else estimate_output_tokens(batch)
 
-        status_area.markdown(
-            f'<div class="progress-text">🔄 {stage_name} — 배치 {n}/{total} 처리 중… '
-            f'(입력 {len(batch):,}자 · 출력 한도 {max_tok:,} 토큰 · {model_id})</div>',
-            unsafe_allow_html=True
-        )
+        out = None
+        last_problem = ""
+        stop_reason = None
 
-        ctx = f"Batch {n} of {total}. Translate this batch COMPLETELY. Do not summarize or merge scenes."
-        if carry_context and prev_tail:
-            ctx += (
-                "\n\n[Tail of the previous batch's output — for continuity of naming, "
-                "keigo level and tone ONLY. Do NOT repeat or re-translate it.]\n"
-                + prev_tail
+        # ★ v2.2.0 — 완결성 검사 실패 시 1회 자동 재시도
+        for attempt in (1, 2):
+            retry_note = " · 재시도" if attempt == 2 else ""
+            status_area.markdown(
+                f'<div class="progress-text">🔄 {stage_name} — 배치 {n}/{total} 처리 중{retry_note}… '
+                f'(입력 {len(batch):,}자 · 출력 한도 {max_tok:,} 토큰 · {model_id})</div>',
+                unsafe_allow_html=True
             )
 
-        try:
-            out, stop_reason = call_api_ex(
-                client, batch, system_prompt, model_id,
-                max_tokens=max_tok, page_info=ctx
-            )
-        except anthropic.APIError as e:
-            msg = f"❌ API 오류 ({stage_name}, 배치 {n}): {e}"
+            ctx = (f"Batch {n} of {total}. Process this batch COMPLETELY, "
+                   "from its first line to its last line. Do not summarize or merge scenes.")
+            if batch_notes and idx < len(batch_notes) and batch_notes[idx]:
+                ctx += f" {batch_notes[idx]}"
+            if carry_context and prev_tail:
+                ctx += (
+                    "\n\n[Tail of the previous batch's output — for continuity of naming, "
+                    "keigo level and tone ONLY. Do NOT repeat or re-translate it.]\n"
+                    + prev_tail
+                )
+
+            try:
+                cand, stop_reason = call_api_ex(
+                    client, batch, system_prompt, model_id,
+                    max_tokens=max_tok, page_info=ctx
+                )
+            except anthropic.APIError as e:
+                msg = f"❌ API 오류 ({stage_name}, 배치 {n}): {e}"
+                st.error(msg)
+                st.session_state["last_error"] = msg
+                return None, report
+            except Exception as e:
+                last_problem = f"{type(e).__name__}: {e}"
+                continue
+
+            if stop_reason == "max_tokens":
+                last_problem = f"출력이 토큰 한도({max_tok:,})에서 잘림"
+                continue
+            if stop_reason == "refusal":
+                last_problem = "모델이 응답을 거부함 (refusal)"
+                continue
+            if not cand.strip():
+                last_problem = f"본문 없이 응답 종료 (stop_reason: {stop_reason or '불명'})"
+                continue
+
+            problem = check_completeness(batch, cand, check_mode, locked=locked)
+            if not problem:
+                out = cand
+                break
+            last_problem = problem
+
+        if out is None:
+            done_note = (f" 완료된 {len(results)}배치는 보관했습니다. "
+                         f"다시 실행하면 {n}배치부터 이어서 진행합니다."
+                         if partial_key and results else "")
+            msg = (f"❌ {stage_name} — 배치 {n}/{total} 결과가 불완전해 저장하지 않았습니다 "
+                   f"(2회 시도). 사유: {last_problem}.{done_note}")
             st.error(msg)
             st.session_state["last_error"] = msg
-            return None, report
-        except Exception as e:
-            msg = f"❌ 오류 ({stage_name}, 배치 {n}): {type(e).__name__}: {e}"
-            st.error(msg)
-            st.session_state["last_error"] = msg
+            if partial_key:
+                st.session_state[partial_key] = {
+                    "sig": sig, "results": list(results), "report": list(report),
+                }
             return None, report
 
         in_scenes = count_scenes(batch, scene_pattern) if scene_pattern else count_scenes(batch)
         out_scenes = len(re.findall(r'^[ \t]*〇', out, re.MULTILINE))
-        truncated = (stop_reason == "max_tokens")
 
         report.append({
             "배치": n,
@@ -1533,39 +1803,27 @@ def run_stage_on_batches(client, batches: list, system_prompt: str,
             "입력 씬": in_scenes,
             "출력 씬": out_scenes,
             "출력 한도": max_tok,
-            "절단": "⚠️ 예" if truncated else "아니오",
+            "절단": "아니오",
             "stop_reason": stop_reason or "-",
         })
 
-        # ★ v2.1 — 빈 출력 가드
-        #   모델이 추론에만 토큰을 쓰고 본문을 내지 않으면 빈 문자열이 온다.
-        #   그대로 저장하면 화면에 아무것도 안 뜨고 실패한 줄도 모른다.
-        if not out.strip():
-            msg = (
-                f"❌ 배치 {n} 출력이 비어 있습니다 (stop_reason: {stop_reason or '불명'}). "
-                f"출력 한도 {max_tok:,} 토큰. 배치 씬 수를 줄이고 다시 실행하세요."
-            )
-            st.error(msg)
-            st.session_state["last_error"] = msg
-            return None, report
-
-        if truncated:
-            st.error(
-                f"⚠️ 배치 {n} 출력이 토큰 한도({max_tok:,})에서 잘렸습니다. "
-                "배치 씬 수를 줄이고 다시 실행하세요."
-            )
-
-        # ★ v2.1 — 씬 누락 경고 (기존에는 리포트에만 남고 화면 경고가 없었다)
         if in_scenes and out_scenes < in_scenes:
             st.warning(
-                f"⚠️ 배치 {n} 씬 누락 — 입력 {in_scenes}씬 → 출력 {out_scenes}씬. "
+                f"⚠️ 배치 {n} 씬 수 불일치 — 입력 {in_scenes} / 출력 {out_scenes}. "
                 "검증 게이트에서 최종 확인하세요."
             )
 
         results.append(out)
         prev_tail = out[-BATCH_CONTEXT_CHARS:] if out else ""
+        if partial_key:
+            st.session_state[partial_key] = {
+                "sig": sig, "results": list(results), "report": list(report),
+            }
         progress_bar.progress(n / total)
 
+    if partial_key:
+        st.session_state.pop(partial_key, None)
+    st.session_state.pop("last_error", None)
     return results, report
 
 
@@ -2026,7 +2284,8 @@ char_map = {}
 char_tones = {}
 char_yomi = {}
 char_cues = {}
-loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {}}
+loc_map = {"extras": {}, "places": {}, "legal": {}, "corrections": {},
+           "fixed_lines": [], "voice_notes": {}}
 
 if char_map_file:
     fname = char_map_file.name.lower()
@@ -2339,7 +2598,8 @@ if not api_key:
 elif not source_text.strip():
     st.warning("⬆️ 시나리오 텍스트를 입력하세요.")
 
-for key in ["stage_1_result", "stage_2_result", "stage_3_result", "stage_4_result", "stage_5_result"]:
+for key in ["stage_1_result", "stage_2_result", "stage_3_result",
+            "stage_4_result", "stage_5_result", "stage_6_result"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -2350,6 +2610,7 @@ _STAGE_LABELS = [
     (3, "③ Voice Rewrite", "stage_3_result"),
     (4, "④ Dialogue Polish", "stage_4_result"),
     (5, "⑤ QA Check", "stage_5_result"),
+    (6, "⑥ Final Revision", "stage_6_result"),
 ]
 _done_flags = [
     bool(st.session_state.get(k) and str(st.session_state.get(k)).strip())
@@ -2369,7 +2630,7 @@ for (num, label, _), done in zip(_STAGE_LABELS, _done_flags):
 st.markdown(f'<div style="margin:0.3rem 0 0.8rem 0;">{"".join(_badges)}</div>',
             unsafe_allow_html=True)
 if all(_done_flags):
-    st.success("🎉 5단계 전부 완료 — 아래 🚦 VALIDATION GATE 에서 검증 후 내보내세요.")
+    st.success("🎉 6단계 전부 완료 — 아래 🚦 VALIDATION GATE 에서 검증 후 내보내세요.")
 elif _next_label:
     st.caption(f"현재 진행 위치: **{_next_label}**")
 
@@ -2428,7 +2689,7 @@ st.caption("한국어 → 일본어 직역. 캐릭터명/통화/문화코드 매
 
 if can_run:
     if st.button("▶️ Stage 1 실행", key="btn_stage1", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
+        client = make_client(api_key)
 
         system_prompt = build_stage1_prompt(
             char_map=char_map,
@@ -2453,11 +2714,15 @@ if can_run:
             client, batches, system_prompt, model_id,
             "Stage 1: Raw Translation", progress_bar, status_area,
             scene_pattern=scene_pat, carry_context=carry_context,
+            max_tokens=MODEL_POLICY["stage_1"].get("max_tokens"),
+            stage_key="stage_1", check_mode="ko2ja",
+            locked=locked_lines_ja(loc_map),
         )
         st.session_state["batch_report_1"] = batch_report
 
         if results is not None:
             st.session_state["stage_1_result"] = "\n\n".join(results)
+            clear_downstream(1)
             status_area.markdown('<div class="progress-text">✅ Stage 1 완료!</div>', unsafe_allow_html=True)
             st.rerun()
 
@@ -2494,7 +2759,7 @@ st.caption("번역체 제거, 일본 시나리오 문체로 리라이트. JP-1~J
 stage_3_input = upload_previous_result(3, "Stage 2 Format", "stage_2_result")
 if stage_3_input and api_key:
     if st.button("▶️ Stage 3 실행", key="btn_stage3", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
+        client = make_client(api_key)
 
         system_prompt = build_stage3_prompt(
             char_map=char_map,
@@ -2516,11 +2781,15 @@ if stage_3_input and api_key:
             client, batches, system_prompt, model_id,
             "Stage 3: Voice Rewrite", progress_bar, status_area,
             scene_pattern=r'^[ \t]*〇', carry_context=carry_context,
+            max_tokens=MODEL_POLICY["stage_3"].get("max_tokens"),
+            stage_key="stage_3", check_mode="ja2ja",
+            locked=locked_lines_ja(loc_map),
         )
         st.session_state["batch_report_3"] = batch_report
 
         if results is not None:
             st.session_state["stage_3_result"] = "\n\n".join(results)
+            clear_downstream(3)
             status_area.markdown('<div class="progress-text">✅ Stage 3 완료!</div>', unsafe_allow_html=True)
             st.rerun()
 elif st.session_state.get("stage_3_result") is None:
@@ -2540,7 +2809,7 @@ st.caption("경어 설계 적용, 대사 전문 폴리시. DP-1~DP-6 원칙.")
 stage_4_input = upload_previous_result(4, "Stage 3 Voice Rewrite", "stage_3_result")
 if stage_4_input and api_key:
     if st.button("▶️ Stage 4 실행", key="btn_stage4", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
+        client = make_client(api_key)
 
         system_prompt = build_stage4_prompt(
             char_map=char_map,
@@ -2562,11 +2831,15 @@ if stage_4_input and api_key:
             client, batches, system_prompt, model_id,
             "Stage 4: Dialogue Polish", progress_bar, status_area,
             scene_pattern=r'^[ \t]*〇', carry_context=carry_context,
+            max_tokens=MODEL_POLICY["stage_4"].get("max_tokens"),
+            stage_key="stage_4", check_mode="ja2ja",
+            locked=locked_lines_ja(loc_map),
         )
         st.session_state["batch_report_4"] = batch_report
 
         if results is not None:
             st.session_state["stage_4_result"] = "\n\n".join(results)
+            clear_downstream(4)
             status_area.markdown('<div class="progress-text">✅ Stage 4 완료!</div>', unsafe_allow_html=True)
             st.rerun()
 elif st.session_state.get("stage_4_result") is None:
@@ -2595,7 +2868,7 @@ if stage_5_input and api_key:
     )
 
     if st.button("▶️ Stage 5 실행", key="btn_stage5", use_container_width=True):
-        client = anthropic.Anthropic(api_key=api_key)
+        client = make_client(api_key)
 
         system_prompt = build_stage5_prompt(
             char_map=char_map,
@@ -2614,7 +2887,8 @@ if stage_5_input and api_key:
         failed = None
         for _i, _b in enumerate(qa_batches):
             _n = _i + 1
-            _max_tok = max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS, int(len(_b) * 2)))
+            _max_tok = MODEL_POLICY["stage_5"].get("max_tokens") or \
+                       max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS, int(len(_b) * 2)))
             status_area.markdown(
                 f'<div class="progress-text">🔍 QA 검증 중 — 배치 {_n}/{len(qa_batches)} '
                 f'(입력 {len(_b):,}자 · 한도 {_max_tok:,} 토큰)</div>',
@@ -2694,6 +2968,97 @@ elif _qa_result is not None and not str(_qa_result).strip() and stage_5_input:
 
 
 # ═══════════════════════════════════════════════════
+# ★ v2.2.0 — STAGE 6: Final Revision (QA 자동 반영)
+# ═══════════════════════════════════════════════════
+st.markdown("---")
+st.markdown("### ⑥ Final Revision — QA 자동 반영 (Sonnet)")
+st.caption(
+    "QA 지적 중 서식·표기 통일 항목만 자동으로 고쳐 최종 원고를 만듭니다 "
+    "(柱 형식·장소명·용어·시각 표기·대시·연속 대사·인물 표기·레이아웃). "
+    "대사 표현·농담·설정·타임라인 제안은 반영하지 않습니다."
+)
+
+_s6_src = st.session_state.get("stage_4_result")
+_s6_qa = st.session_state.get("stage_5_result")
+
+if _s6_src and _s6_qa and str(_s6_qa).strip() and api_key:
+    if st.button("▶️ Stage 6 실행 — 최종 원고 만들기", key="btn_stage6", use_container_width=True):
+        client = make_client(api_key)
+        policy = MODEL_POLICY["stage_6"]
+        status_area = st.empty()
+        progress_bar = st.progress(0)
+
+        # ① 규칙 기반 정리 (무료)
+        base_text = normalize_layout(_s6_src)
+
+        # ② 표기 통일 기준표 (한 번만 만들고 재실행 시 재사용)
+        style_sheet = st.session_state.get("stage_6_style_sheet")
+        if not style_sheet:
+            status_area.markdown('<div class="progress-text">📐 표기 통일 기준표 작성 중...</div>',
+                                 unsafe_allow_html=True)
+            try:
+                heads = "\n".join(scene_heading_list(base_text))
+                style_sheet = call_api(
+                    client,
+                    f"## QA REPORT\n{_s6_qa}\n\n## 柱 LIST (in order)\n{heads}",
+                    build_stage6_style_prompt(loc_map=loc_map),
+                    policy["model"],
+                    max_tokens=policy.get("style_max_tokens", 16000),
+                )
+                st.session_state["stage_6_style_sheet"] = style_sheet
+            except Exception as e:
+                st.error(f"❌ 기준표 작성 오류: {e}")
+                style_sheet = None
+
+        # ③ 배치별 기계적 수정
+        if style_sheet:
+            system_prompt = build_stage6_fix_prompt(
+                style_sheet, qa_report=_s6_qa, loc_map=loc_map,
+                glossary_text=glossary_text,
+            )
+            s6_batches, _, s6_scenes = split_into_scene_batches(
+                base_text, scenes_per_batch, pattern=r'^[ \t]*〇')
+            st.info(f"🎬 〇柱 기준 {s6_scenes}씬 → {len(s6_batches)}배치")
+
+            notes, pos = [], 0
+            for pg in s6_batches:
+                _at = base_text.find(pg[:200], pos)
+                _at = _at if _at >= 0 else pos
+                intro = introduced_before(base_text, _at, char_cues)
+                notes.append(
+                    "ALREADY INTRODUCED (대사 헤드 표기만 사용): " + ", ".join(intro)
+                    if intro else "この時点ではまだ誰も初出していない"
+                )
+                pos = _at + len(pg)
+
+            results, s6_report = run_stage_on_batches(
+                client, s6_batches, system_prompt, policy["model"],
+                "Stage 6: Final Revision", progress_bar, status_area,
+                scene_pattern=r'^[ \t]*〇', carry_context=False,
+                max_tokens=policy["max_tokens"],
+                stage_key="stage_6", check_mode="fix",
+                locked=locked_lines_ja(loc_map), batch_notes=notes,
+            )
+            st.session_state["batch_report_6"] = s6_report
+
+            if results is not None:
+                st.session_state["stage_6_result"] = normalize_layout("\n\n".join(results))
+                for k in ("audit_report", "enforced_result", "enforce_log", "gate_result"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+elif not (_s6_qa and str(_s6_qa).strip()):
+    st.caption("⏳ Stage 5 (QA)를 먼저 완료하세요.")
+
+if st.session_state.get("stage_6_style_sheet"):
+    with st.expander("📐 표기 통일 기준표 (Stage 6이 따른 기준)", expanded=False):
+        st.text(st.session_state["stage_6_style_sheet"])
+
+show_stage_result(6, "Final Revision", "stage_6_result",
+                  "아래 🚦 VALIDATION GATE 에서 검증한 뒤 DOCX로 내보내세요.")
+
+
+# ═══════════════════════════════════════════════════
 # ★ v2.0 — VALIDATION GATE (원본 대비 분량·표기 대조)
 # 씬이 사라졌는데 모르고 완성본을 내보내는 사고를 막는다.
 # ═══════════════════════════════════════════════════
@@ -2702,7 +3067,8 @@ st.markdown("### 🚦 VALIDATION GATE — 출고 전 검증")
 st.caption("원본 한국어 원고와 번역 결과를 대조합니다. 씬 수·글자 수·대사 수·금지 표기를 봅니다.")
 
 _gate_target = (
-    st.session_state.get("stage_4_result")
+    st.session_state.get("stage_6_result")
+    or st.session_state.get("stage_4_result")
     or st.session_state.get("stage_3_result")
     or st.session_state.get("stage_2_result")
     or st.session_state.get("stage_1_result")
@@ -2741,6 +3107,7 @@ else:
         ("Stage 1", st.session_state.get("batch_report_1")),
         ("Stage 3", st.session_state.get("batch_report_3")),
         ("Stage 4", st.session_state.get("batch_report_4")),
+        ("Stage 6", st.session_state.get("batch_report_6")),
     ]
     _reports = [(n, r) for n, r in _reports if r]
     if _reports:
@@ -2763,7 +3130,8 @@ st.markdown("### 🔎 LOCALIZATION AUDIT — 로컬라이징 검수")
 st.caption("대조표가 실제로 반영됐는지 기계적으로 대조합니다. 한글·카타카나 한국명·원화 잔존을 잡아냅니다.")
 
 _audit_source = (
-    st.session_state.get("stage_4_result")
+    st.session_state.get("stage_6_result")
+    or st.session_state.get("stage_4_result")
     or st.session_state.get("stage_3_result")
     or st.session_state.get("stage_2_result")
     or st.session_state.get("stage_1_result")
@@ -2868,7 +3236,8 @@ else:
             key="dl_enforced",
         )
         if st.button("↪️ 치환본을 최신 결과로 반영", key="btn_apply_enforced", use_container_width=True):
-            for _k in ["stage_4_result", "stage_3_result", "stage_2_result", "stage_1_result"]:
+            for _k in ["stage_6_result", "stage_4_result", "stage_3_result",
+                       "stage_2_result", "stage_1_result"]:
                 if st.session_state.get(_k):
                     st.session_state[_k] = st.session_state["enforced_result"]
                     break
@@ -2883,7 +3252,8 @@ else:
 # ═══════════════════════════════════════════════════
 
 final_result = (
-    st.session_state.get("stage_4_result")
+    st.session_state.get("stage_6_result")
+    or st.session_state.get("stage_4_result")
     or st.session_state.get("stage_3_result")
     or st.session_state.get("stage_2_result")
     or st.session_state.get("stage_1_result")
@@ -2901,7 +3271,9 @@ if final_result:
     else:
         base_filename = "Screenplay_JP"
 
-    if st.session_state.get("stage_4_result"):
+    if st.session_state.get("stage_6_result"):
+        st.caption("✅ Stage 6 (Final Revision — QA 자동 반영) 최종 원고 기준")
+    elif st.session_state.get("stage_4_result"):
         st.caption("✅ Stage 4 (Dialogue Polish) 결과 기준")
     elif st.session_state.get("stage_3_result"):
         st.caption("⚠️ Stage 3 (Voice Rewrite) 결과 기준 — Stage 4 미완료")
@@ -2974,9 +3346,11 @@ if final_result:
     st.markdown("")
     if st.button("🗑️ 전체 초기화 (새 프로젝트)", use_container_width=True):
         for key in ["stage_1_result", "stage_2_result", "stage_3_result",
-                     "stage_4_result", "stage_5_result", "last_error",
-                     "audit_report", "enforced_result", "enforce_log",
-                     "gate_result", "batch_report_1", "batch_report_3", "batch_report_4"]:
+                     "stage_4_result", "stage_5_result", "stage_6_result",
+                     "stage_6_style_sheet", "last_error",
+                     "audit_report", "enforced_result", "enforce_log", "gate_result",
+                     "batch_report_1", "batch_report_3", "batch_report_4", "batch_report_6",
+                     "partial_stage_1", "partial_stage_3", "partial_stage_4", "partial_stage_6"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
