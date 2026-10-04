@@ -15,6 +15,31 @@ Keigo Tags: keigo / teinei / tameguchi / kenson / ibar
 ─────────────────────────────────────────────
 CHANGELOG (최신이 위)
 ─────────────────────────────────────────────
+v2.2.0 (2026-10-04)
+  - 영문 엔진 v2.4.0 반영 — 일본어판 대응
+  - MODEL_POLICY 갱신
+    · 모델 ID: claude-sonnet-5 → claude-sonnet-5-5 / claude-opus-5 → claude-opus-5-5
+    · 단계별 max_tokens 신설 (Stage 1·3·4 = 32,000 / Stage 5 = 64,000)
+      Claude 5.5 계열은 사고(adaptive thinking)가 기본 ON이며 사고 분량도
+      max_tokens에 합산된다. 한도가 낮으면 본문 없이 끝날 수 있다.
+  - 기능 추가: LOCKED LINES — 대조표 '핵심 대사 고정 번역' 시트
+    지정된 대사는 Stage 1·3·4에서 한 글자도 바꾸지 않고 그대로 쓴다.
+  - 기능 추가: CHARACTER VOICE NOTES — 대조표 '말투 지침' 시트
+    작가가 직접 쓴 인물별 말투 지침. 일반 경어 태그보다 우선한다.
+    신설 함수: build_voice_notes_section()
+  - 기능 추가: STAGE 6 — Final Revision (QA 자동 반영, 기계적 항목만)
+    · 신설 상수: STAGE_6_STYLE_SHEET (표기 통일 기준표 작성)
+                 STAGE_6_AUTO_FIX (허용 수정 F1~F9 / 금지 사항 명시)
+      F1 柱 형식·장소명 통일  F2 용어 통일  F3 시각 표기  F4 대시
+      F5 연속 대사 話者名 처리  F6 초출/재등장 인물 표기  F7 전환 표기
+      F8 레이아웃  F9 대조표 용어 형식
+    · 대사 표현·농담·설정·타임라인 수정은 반영하지 않음 (작가 판단 영역)
+    · 신설 함수: build_stage6_style_prompt() / build_stage6_fix_prompt()
+  - STAGE_1 RULE 11 추가 — CREDITS: 제작사 표기 BLUE JEANS PICTURES 고정
+  - STAGE_3 / STAGE_4 OUTPUT — 柱 전수 유지, LOCKED LINES 보존 명시
+  - STAGE_5 REPORT LENGTH 지침 추가 (문제만 보고, 수정 목록 상위 25개)
+  - build_stage1/3/4/5_prompt()에 고정 대사·말투 지침 자동 주입
+
 v2.1 (2026-09-18)
   - main.py 측 Stage 5 빈 응답 사고 대응에 맞춘 버전 동기화.
     프롬프트 룰셋 변경 없음. (ENGINE_VERSION 단일 출처 유지)
@@ -86,7 +111,7 @@ v1.0
 # ENGINE VERSION (세만틱 버저닝)
 # ═══════════════════════════════════════════════════
 
-ENGINE_VERSION = "2.1"
+ENGINE_VERSION = "2.2.0"
 ENGINE_BUILD_DATE = "2026-09-17"
 
 
@@ -469,6 +494,9 @@ Output in 横書き (horizontal writing) format for pitch/proposal use.
 10. Anything Korea-specific NOT in the map must still be localized by inference to Japan,
    consistently across the whole script. Never leave a katakana transliteration of a Korean
    proper noun as a placeholder.
+11. CREDITS — 제작사 표기는 언제나 "BLUE JEANS PICTURES" 로 쓴다.
+   (블루진픽처스 / 블루진 픽처스 / 블루진스 / ブルージーンズ 모두 이 표기로 통일.
+    "Blue Gene", "Bluejean", "ブルージーン" 같은 변형은 오기다.)
 
 ## CHARACTER NAME RULES
 - Apply the character map provided (Korean → Japanese names).
@@ -598,6 +626,9 @@ RULE: 韓国固有の情緒コードを日本の等価物に。感情の機能�
 
 ## OUTPUT
 Return the COMPLETE rewritten screenplay. Do not skip scenes.
+入力にあった柱（〇…）は、すべて同じ順序で出力に現れなければならない。
+要約したり途中で止めたりせず、受け取った最後の行まで書き直す。
+LOCKED LINES に挙げられた台詞は一字一句そのまま残す。
 Do not add commentary. Output ONLY the screenplay."""
 
 
@@ -650,6 +681,9 @@ When two characters interact, their respective tags determine the dynamic:
 ## OUTPUT
 Return the COMPLETE screenplay with polished dialogue.
 ト書き and 柱 must be returned UNCHANGED.
+入力にあった柱（〇…）は、すべて同じ順序で出力に現れなければならない。
+要約したり途中で止めたりせず、受け取った最後の行まで返す。
+LOCKED LINES に挙げられた台詞は磨かない — 一字一句そのまま残す。
 Do not add commentary. Output ONLY the screenplay."""
 
 
@@ -756,6 +790,12 @@ SPECIFIC FIXES NEEDED:
 ...
 ```
 
+## REPORT LENGTH (v2.2.0)
+- 問題だけを報告する。確認して問題がなかった項目は列挙しない。
+- 1件につき1行。場所がわかる程度の短い引用だけにし、本文をまるごと引用しない。
+- SPECIFIC FIXES NEEDED: 影響の大きい順に最大25件。
+- 全体で日本語2,000字程度に収める。
+
 Be thorough but fair. A score of 8+ means ready for pitch submission to Japanese producers."""
 
 
@@ -854,6 +894,11 @@ def build_stage3_prompt(
     if char_tones:
         parts.append(_build_tone_section(char_tones))
 
+    # ★ v2.2.0 — 작가의 말투 지침
+    vn = build_voice_notes_section(loc_map)
+    if vn:
+        parts.append(vn)
+
     if style_prompt:
         parts.append(f"\n## GENRE STYLE\n{style_prompt}")
 
@@ -895,6 +940,11 @@ def build_stage4_prompt(
     if char_tones:
         parts.append(_build_tone_section(char_tones))
 
+    # ★ v2.2.0 — 작가의 말투 지침
+    vn = build_voice_notes_section(loc_map)
+    if vn:
+        parts.append(vn)
+
     if style_prompt:
         parts.append(f"\n## GENRE STYLE\n{style_prompt}")
 
@@ -922,6 +972,119 @@ def build_stage5_prompt(char_map: dict = None, loc_map: dict = None,
     loc_section = build_localization_section(loc_map)
     if loc_section:
         parts.append(loc_section)
+
+    gl = build_glossary_block(glossary_text)
+    if gl:
+        parts.append(gl)
+
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.2.0 — STAGE 6: FINAL REVISION (QA 자동 반영 — 기계적 항목만)
+# ═══════════════════════════════════════════════════
+
+STAGE_6_STYLE_SHEET = """あなたは最終の機械的クリーンアップに向けて STYLE SHEET を作る記録係である。
+受け取るのは (1) 脚本のQAレポート と (2) 柱（シーン見出し）の全リスト（順番どおり）。
+
+次のセクションからなる STYLE SHEET を平文で出す（JSON不可、コメント不可）。
+
+## 柱の書式
+標準形をひとつだけ決める。例: 〇万福葬祭・安置室（夜）
+  · 〇の直後に空白を入れない
+  · 場所の階層は「・」で区切る
+  · 時間帯は末尾の（）に置く
+
+## 場所名の正式表記
+二通り以上の書き方がある場所ごとに1行:
+  正式表記  ←  ゆれ, ゆれ, ...
+最も多く使われている形を採る。QAが指摘した同義語（作業場／木工所 など）は統合する。
+本当に別の場所であるサブロケーションは分けたままにする。
+
+## 複合場所の柱
+「／」でふたつの場所をつないだ柱があれば、分けて書くべき二つの柱を示す。
+
+## 用語の統一
+QAが「ゆれている」と指摘した語だけ（物・場所名詞・機関名）:
+  正式  ←  ゆれ
+LOCALIZATION MAP に定義がある語は、マップの形が正式である。
+
+## 時刻の表記
+本文と台詞の中の時刻の書き方をひとつに決める（例: 午前六時 / 三時四十分）。
+
+## 転換表記
+カットバック・フェイドアウト等の書き方をひとつに決める。
+
+## 人物名の表記
+初出は フルネーム（年代）、以降は 대사 헤드 の表記のみ。
+連続する台詞の二行目以降は話者名を書かない。
+
+600字以内に収める。台詞の書き換え・ギャグ・筋・時系列の変更は提案しない。"""
+
+
+STAGE_6_AUTO_FIX = """あなたは完成した日本語脚本の最終機械チェックを行う記録係である。
+文章はロック済みである。STYLE SHEET に従って、書式と表記の統一だけを直す。
+
+## 直してよい項目（これだけ）
+F1. 柱 — STYLE SHEET の標準形と正式な場所名に書き換える。
+    〇の直後の空白を取る。複合場所の柱は指示どおり二つに分ける。
+F2. 用語の統一 — ゆれている語を正式な語に置き換える（ト書き・台詞の両方）。
+    その文の他の部分は一切変えない。
+F3. 時刻の表記 — TIME NOTATION のルールを適用する。
+F4. ダッシュ — 中断・言いさしには「——」を使う。「--」「~」は使わない。
+F5. 連続する台詞 — 同じ人物が続けて話す二行目以降は話者名を外し「台詞」だけにする。
+    話者が変わったら必ず話者名を書く。
+F6. 人物名の表記 — 初出は フルネーム（年代）。
+    ALREADY INTRODUCED に挙がっている人物は、以降 대사 헤드 の表記だけを使う
+    （例: 「福田万蔵が振り向く」→「万蔵が振り向く」）。
+F7. 転換表記 — TRANSITIONS のルールを適用し、それぞれ独立した行に置く。
+F8. レイアウト — 全行を左寄せ。要素の間に空行。
+    話者名と台詞は同じ行（話者名「台詞」）、演技指示は「」の内側。
+    V.O./声のみ/OFF は「」の外側、話者名の直後。
+F9. LOCALIZATION MAP の用語 — マップにある語がマップ外の形で書かれていたら、マップの形にする。
+
+## してはならないこと
+- F1〜F9 を超えて台詞やト書きを書き換える・言い換える・短くする・「良くする」
+- QAレポートの LANGUAGE / STORY 提案（言い回し、ギャグ、時系列、伏線、新しいビート）に手を出す
+- シーン・ビート・行を足す、消す、統合する、順序を変える
+- LOCKED LINES に触れる — 一字一句そのまま残す
+- ハングルを残す、カタカナ韓国固有名詞に戻す
+- 翻訳、説明、コメントを書く
+
+## OUTPUT
+許された修正だけを適用した完全な原稿を、最初の行から最後の行まで返す。
+脚本本文だけを出力する。"""
+
+
+def build_stage6_style_prompt(loc_map: dict = None) -> str:
+    """★ v2.2.0 — Stage 6 표기 통일 기준표 생성용 시스템 프롬프트."""
+    parts = [STAGE_6_STYLE_SHEET, SCREENPLAY_FORMAT]
+    loc_section = build_localization_section(loc_map)
+    if loc_section:
+        parts.append(loc_section)
+    return "\n".join(parts)
+
+
+def build_stage6_fix_prompt(
+    style_sheet: str,
+    qa_report: str = "",
+    loc_map: dict = None,
+    glossary_text: str = "",
+) -> str:
+    """★ v2.2.0 — Stage 6 자동 반영(기계적 수정) 시스템 프롬프트."""
+    parts = [STAGE_6_AUTO_FIX, SCREENPLAY_FORMAT]
+    parts.append(f"\n## STYLE SHEET — これに厳密に従う\n{(style_sheet or '').strip()}")
+
+    loc_section = build_localization_section(loc_map)
+    if loc_section:
+        parts.append(loc_section)
+
+    if qa_report:
+        parts.append(
+            "\n## QA REPORT — 参照のみ\n"
+            "F1〜F9 に当てはまる項目だけを適用する。それ以外の提案はすべて無視する。\n"
+            f"{qa_report.strip()}"
+        )
 
     gl = build_glossary_block(glossary_text)
     if gl:
@@ -998,6 +1161,24 @@ def build_localization_section(loc_map: dict) -> str:
             f"{lines}"
         )
 
+    # ★ v2.2.0 — 핵심 대사 고정 번역
+    fixed = loc_map.get("fixed_lines") or []
+    if fixed:
+        lines = []
+        for f in fixed:
+            tag = " · ".join(x for x in [
+                f"S#{f.get('scene')}" if f.get("scene") else "",
+                f.get("speaker") or "",
+            ] if x)
+            lines.append(f"  · [{tag}] {f.get('ko')}\n    → {f.get('ja')}")
+        blocks.append(
+            "### LOCKED LINES — 一字一句そのまま使う\n"
+            "左の韓国語セリフが出てきたら、右の日本語だけが正解である。\n"
+            "一字も変えずにそのまま書き写す。後続の工程でも磨いてはならない。\n"
+            "行内の「/」は改行または別ビートを示す。\n"
+            + "\n".join(lines)
+        )
+
     corrections = loc_map.get("corrections") or {}
     if corrections:
         lines = "\n".join([f"  · \"{bad}\" → \"{good}\"" for bad, good in corrections.items()])
@@ -1022,6 +1203,20 @@ in its mapped Japanese form, and its Korean/incorrect form must appear nowhere.
 ### SELF-CHECK BEFORE OUTPUT
 出力前に自分の原稿を一度走査する。ハングル、カタカナ韓国固有名詞、ウォン表記、
 韓国の官庁名・法令名、上記左側の語が1つでも残っていたら、返す前に直す。"""
+
+
+def build_voice_notes_section(loc_map: dict) -> str:
+    """★ v2.2.0 — 대조표 '말투 지침' 시트를 Stage 3·4 프롬프트로 만든다."""
+    notes = (loc_map or {}).get("voice_notes") or {}
+    if not notes:
+        return ""
+    lines = "\n".join(f"  · {who}: {note}" for who, note in notes.items())
+    return f"""
+## CHARACTER VOICE NOTES — 原作者からの指示
+以下は原作者が直接書いた人物別の話し方の指示である。
+一般的な敬語タグより優先する。各人物の日本語の声は、
+場面が変わってもこの指示どおりに保つこと。
+{lines}"""
 
 
 def _build_tone_section(char_tones: dict) -> str:
@@ -1053,26 +1248,41 @@ def _build_tone_section(char_tones: dict) -> str:
 #   구 세대는 날짜 포함형        예) claude-haiku-4-5-20251001
 #   claude-sonnet-4-20250514 / claude-opus-4-20250514 은 2026-06-15 자로 폐기됨.
 
+# ★ v2.2.0 — Claude 5.5 계열은 답변 전 사고(adaptive thinking)가 기본으로 켜져 있고,
+#   사고 분량도 max_tokens 안에서 함께 차감된다. 한도가 낮으면 사고만 하다
+#   본문 없이 끝날 수 있으므로 단계별 한도를 넉넉히 둔다.
+#   (청구는 실제 사용량 기준 — 한도를 올려도 쓰지 않은 만큼은 과금되지 않음)
 MODEL_POLICY = {
     "stage_1": {
         "name": "Raw Translation",
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "reason": "정확한 번역 — 속도+품질 균형",
+        "max_tokens": 32000,
     },
     "stage_3": {
         "name": "Voice Rewrite",
-        "model": "claude-opus-5",
+        "model": "claude-opus-5-5",
         "reason": "네이티브 문체 리라이팅 — 최고 품질 필수",
+        "max_tokens": 32000,
     },
     "stage_4": {
         "name": "Dialogue Polish",
-        "model": "claude-opus-5",
+        "model": "claude-opus-5-5",
         "reason": "경어 설계 + 대사 현지화 — 문화적 뉘앙스 필수",
+        "max_tokens": 32000,
     },
     "stage_5": {
         "name": "QA Check",
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "reason": "체크리스트 기반 검증 — Sonnet으로 충분",
+        "max_tokens": 64000,   # 원고 전체 검토 시 사고량 증가
+    },
+    "stage_6": {
+        "name": "Final Revision",
+        "model": "claude-sonnet-5-5",
+        "reason": "QA 지적 중 서식·표기 통일만 자동 반영",
+        "max_tokens": 32000,
+        "style_max_tokens": 16000,
     },
 }
 
