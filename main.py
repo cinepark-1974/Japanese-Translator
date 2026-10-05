@@ -2388,12 +2388,12 @@ if not char_map and st.session_state.get("saved_char_map"):
 if char_map and not char_tones:
     with st.expander("🎭 캐릭터별 경어 태그 수동 설정 (선택)"):
         st.caption("CSV 3번째 열 없이 여기서 직접 설정할 수 있어요.")
-        for ko, jp in char_map.items():
+        for i, (ko, jp) in enumerate(char_map.items()):
             tone = st.selectbox(
-                f"{jp}",
+                f"{jp} ({ko})",
                 ["—", "keigo", "teinei", "tameguchi", "kenson", "ibar"],
                 index=0,
-                key=f"tone_{jp}",
+                key=f"tone_{ko}_{jp}_{i}",
             )
             if tone != "—":
                 char_tones[jp] = tone
@@ -2401,6 +2401,7 @@ if char_map and not char_tones:
 with st.expander("📋 XLSX 대조표 양식 안내", expanded=False):
     st.markdown("""
 **시트 구성** — 시트명에 아래 단어가 들어가면 자동 분류됩니다.
+""")
 
 | 시트명 예시 | 분류 | 인식 키워드 |
 |---|---|---|
