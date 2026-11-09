@@ -2161,7 +2161,7 @@ def generate_docx(text: str, make_cover: bool = True, page_numbers: bool = True,
 # ═══════════════════════════════════════════════════
 
 # ── Header ──
-render_header("JAPANESE-TRANSLATOR", note=f"v{VERSION} · 5-Stage Market Adaptation Pipeline")
+render_header("JAPANESE-TRANSLATOR", tagline="JAPANESE-MARKET SUBMISSION", note=f"v{VERSION} · 5-Stage Market Adaptation Pipeline")
 
 st.markdown("---")
 
